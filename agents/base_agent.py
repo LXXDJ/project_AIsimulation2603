@@ -1,15 +1,18 @@
 from abc import ABC, abstractmethod
 from environment.state import GameState, ACTIONS
+from environment.personality import Personality
 from llm.client import LLMClient
 
 
 class BaseAgent(ABC):
     """모든 에이전트의 공통 인터페이스."""
 
-    name: str = "BaseAgent"
+    base_name: str = "BaseAgent"
 
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: LLMClient, personality: Personality | None = None):
         self.llm = llm
+        self.personality = personality
+        self.name = f"{self.base_name}_{personality.name}" if personality else self.base_name
         self.history: list[dict] = []   # {"day": int, "action": str, "observation": str}
 
     @abstractmethod
