@@ -223,6 +223,11 @@ def roll_events(rng: random.Random | None = None, personality=None, state=None) 
     ):
         multiplier = personality.get_event_multiplier(tier_name) if personality else 1.0
         if r.random() < base_chance * multiplier:
-            weights = [e.probability * sw.get(e.name, 1.0) for e in tier_pool]
+            weights = [
+                e.probability
+                * sw.get(e.name, 1.0)                                    # 상태 기반
+                * (personality.get_event_weight(e.name) if personality else 1.0)  # 성향 기반
+                for e in tier_pool
+            ]
             result.append(r.choices(tier_pool, weights=weights, k=1)[0])
     return result

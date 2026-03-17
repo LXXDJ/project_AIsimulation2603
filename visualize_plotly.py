@@ -437,11 +437,22 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             hoverinfo="skip",
         ), row=1, col=1)
 
+        # 범례에 최종 결과 표시
+        r_data = d["result"]
+        if r_data.get("is_fired"):
+            legend_suffix = " (해고)"
+        elif r_data.get("is_resigned"):
+            legend_suffix = " (퇴사)"
+        else:
+            final_pos = r_data.get("final_position", "")
+            legend_suffix = f" ({final_pos})" if final_pos else ""
+        legend_name = d["display"] + legend_suffix
+
         # 이동평균 (진하게)
         fig.add_trace(go.Scatter(
             x=days, y=ma,
             mode="lines",
-            name=d["display"],
+            name=legend_name,
             legendgroup=d["display"],
             line=dict(color=color, width=2.5),
             fill="tozeroy",
@@ -497,6 +508,34 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
                 showlegend=False,
                 hovertemplate="%{text}<extra></extra>",
                 text=jc_texts,
+            ), row=1, col=1)
+
+        # 종료 마커 (해고/퇴사 시 그래프 끝에 X 표시)
+        r_data = d["result"]
+        if r_data.get("is_fired") or r_data.get("is_resigned"):
+            last_step = steps[-1]
+            last_day = last_step["day"]
+            last_score = _composite_score(last_step)
+            if r_data.get("is_fired"):
+                end_label = "해고"
+                end_symbol = "x"
+            else:
+                end_label = "자진퇴사"
+                end_symbol = "cross"
+            end_text = (
+                f"<b>{end_label}</b><br>{d['display']}<br>"
+                f"Day {last_day} ({last_day // 365}년 {(last_day % 365) // 30}개월)<br>"
+                f"최종: {last_step['position']}  |  연봉: {last_step['salary']:,}원"
+            )
+            fig.add_trace(go.Scatter(
+                x=[last_day], y=[last_score],
+                mode="markers",
+                marker=dict(color=color, size=14, symbol=end_symbol,
+                            line=dict(color="white", width=2)),
+                legendgroup=d["display"],
+                showlegend=False,
+                hovertemplate="%{text}<extra></extra>",
+                text=[end_text],
             ), row=1, col=1)
 
     fig.update_xaxes(tickvals=tickvals, ticktext=ticktext,

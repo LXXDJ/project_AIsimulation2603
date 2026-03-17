@@ -574,3 +574,79 @@ class CompanyEnvironment:
             and self.state.reputation >= req["reputation"]
             and self.state.day >= req["min_days"]
         )
+
+    # ------------------------------------------------------------------
+    # 원인 분석 API
+    # ------------------------------------------------------------------
+
+    def analyze_promotion(self) -> dict:
+        """승진 시 어떤 스탯이 기여했는지 분석."""
+        # 승진 직후 호출 — position은 이미 새 직급이므로 이전 직급 요건 참조
+        prev_idx = POSITIONS.index(self.state.position) - 1
+        prev_pos = POSITIONS[prev_idx] if prev_idx >= 0 else "사원"
+        req = self.promotion_requirements.get(prev_pos, {})
+        stats = {
+            "skill": {"value": round(self.state.skill, 1), "required": req.get("skill", 0)},
+            "performance": {"value": round(self.state.performance, 1), "required": req.get("performance", 0)},
+            "boss_favor": {"value": round(self.state.boss_favor, 1), "required": req.get("boss_favor", 0)},
+            "reputation": {"value": round(self.state.reputation, 1), "required": req.get("reputation", 0)},
+        }
+        # 가장 크게 초과한 스탯 = 강점
+        best = max(stats, key=lambda k: stats[k]["value"] - stats[k]["required"])
+        return {"stats": stats, "strength": best}
+
+    def analyze_fire(self) -> dict:
+        """해고 시 어떤 스탯이 원인인지 분석."""
+        s = self.state
+        analysis: dict = {"reason": "", "bottlenecks": [], "stats": {}}
+
+        # 성과 부진 해고
+        if s.performance < FIRE_THRESHOLD["performance"] and s.boss_favor < FIRE_THRESHOLD["boss_favor"]:
+            analysis["reason"] = "성과_부진"
+            analysis["stats"] = {
+                "performance": {"value": round(s.performance, 1), "threshold": FIRE_THRESHOLD["performance"]},
+                "boss_favor": {"value": round(s.boss_favor, 1), "threshold": FIRE_THRESHOLD["boss_favor"]},
+            }
+            return analysis
+
+        # 승진 미달 해고
+        total_career = s.day
+        current_level = s.position_level
+        for career_threshold, min_level in self.CAREER_POSITION_FLOOR:
+            if total_career >= career_threshold and current_level < min_level:
+                analysis["reason"] = "승진_미달"
+                target_pos = POSITIONS[min_level]
+                # 해당 직급으로 가려면 어떤 요건이 부족했는지
+                # 현재 직급에서 다음 직급으로의 요건 확인
+                req = self.promotion_requirements.get(s.position, {})
+                for stat_name in ["skill", "performance", "boss_favor", "reputation"]:
+                    req_val = req.get(stat_name, 0)
+                    cur_val = getattr(s, stat_name, 0)
+                    entry = {"value": round(cur_val, 1), "required": req_val}
+                    analysis["stats"][stat_name] = entry
+                    if cur_val < req_val:
+                        analysis["bottlenecks"].append(stat_name)
+                analysis["target_position"] = target_pos
+                return analysis
+
+        return analysis
+
+    def analyze_resignation(self) -> dict:
+        """퇴사 시 원인 분석."""
+        s = self.state
+        if self._burnout_counter >= 30:
+            return {
+                "reason": "번아웃",
+                "detail": f"스트레스 {s.stress:.0f} / 체력 {s.energy:.0f} 상태가 {self._burnout_counter}일 지속",
+                "stress": round(s.stress, 1),
+                "energy": round(s.energy, 1),
+                "duration": self._burnout_counter,
+            }
+        else:
+            return {
+                "reason": "만성_스트레스",
+                "detail": f"스트레스 70+ 상태가 누적 {self._chronic_stress_days}일 (임계: 180일)",
+                "stress": round(s.stress, 1),
+                "energy": round(s.energy, 1),
+                "duration": self._chronic_stress_days,
+            }

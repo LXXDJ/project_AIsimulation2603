@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from environment.state import GameState, ACTIONS
 from environment.personality import Personality
 from llm.client import LLMClient
+from memory.episodic import EpisodicMemory
 
 
 class BaseAgent(ABC):
@@ -15,6 +16,7 @@ class BaseAgent(ABC):
         self.name = f"{self.base_name}_{personality.name}" if personality else self.base_name
         self.history: list[dict] = []   # {"day": int, "action": str, "observation": str}
         self._last_comment: str = ""    # 배치 결정 시 LLM이 생성한 한줄 코멘트
+        self.memory = EpisodicMemory(capacity=50)  # 중요 사건 기억 저장소
 
     @abstractmethod
     def decide(self, state: GameState, observation: str) -> str:
@@ -29,6 +31,7 @@ class BaseAgent(ABC):
 
     def reset(self):
         self.history = []
+        self.memory = EpisodicMemory(capacity=50)
 
     # ------------------------------------------------------------------
     # 공통 유틸

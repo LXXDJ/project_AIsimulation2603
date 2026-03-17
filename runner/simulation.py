@@ -5,6 +5,7 @@ from pathlib import Path
 from tqdm import tqdm
 from environment.company import CompanyEnvironment
 from agents.base_agent import BaseAgent
+from memory.episodic import Episode
 
 
 def run_simulation(
@@ -79,6 +80,7 @@ def run_simulation(
 
         # 기록
         agent.record(day, action, full_observation)
+        _store_episode_if_important(agent, day, action, state, full_observation)
         step = {
             "type": "step",
             "day": day,
@@ -126,14 +128,34 @@ def run_simulation(
 
             pbar.set_postfix_str(f"{state.position}  {state.salary:,}원", refresh=False)
 
+        # 승진/이직 분석 로그
+        if "승진!" in full_observation:
+            analysis_text = _format_promotion_analysis(env)
+            txt_file.write(f"[{agent.name}] Day {day} 승진!\n{analysis_text}\n")
+            txt_file.flush()
+            # JSONL에도 기록
+            log_file.write(json.dumps({
+                "type": "promotion", "day": day,
+                "analysis": env.analyze_promotion(),
+            }, ensure_ascii=False) + "\n")
+            log_file.flush()
+
         if not state.is_alive:
             status = "해고" if state.is_fired else "자진퇴사"
-            txt_file.write(f"[{agent.name}] {day}일차에 {status}됨.\n")
+            analysis_text = _format_exit_analysis(env)
+            txt_file.write(f"[{agent.name}] {day}일차에 {status}됨.\n{analysis_text}\n")
             txt_file.flush()
+            # JSONL에도 분석 기록
+            exit_analysis = env.analyze_fire() if state.is_fired else env.analyze_resignation()
+            log_file.write(json.dumps({
+                "type": "exit", "day": day, "status": status,
+                "analysis": exit_analysis,
+            }, ensure_ascii=False) + "\n")
+            log_file.flush()
             pbar.set_postfix_str(f"→ {status}", refresh=True)
             break
 
-    result = _build_result(agent.name, state, step_logs, max_days)
+    result = _build_result(agent.name, state, step_logs, max_days, env)
 
     # 결과 기록 후 파일 닫기
     log_file.write(json.dumps({"type": "result", **result}, ensure_ascii=False) + "\n")
@@ -147,6 +169,115 @@ def run_simulation(
     result["txt_path"] = str(txt_path)
 
     return result
+
+
+STAT_LABELS = {
+    "skill": "업무능력",
+    "performance": "성과",
+    "boss_favor": "상사신뢰",
+    "reputation": "평판",
+}
+
+
+def _format_exit_analysis(env) -> str:
+    """해고/퇴사 시 상세 원인 분석 텍스트를 생성한다."""
+    state = env.state
+    lines = []
+
+    if state.is_fired:
+        info = env.analyze_fire()
+        if info["reason"] == "성과_부진":
+            lines.append("  원인: 성과 + 상사신뢰 동시 저조")
+            for k, v in info["stats"].items():
+                label = STAT_LABELS.get(k, k)
+                lines.append(f"    {label}: {v['value']} (해고 기준: {v['threshold']} 미만)")
+        elif info["reason"] == "승진_미달":
+            lines.append(f"  원인: 경력 대비 직급 미달 (요구: {info['target_position']})")
+            lines.append(f"  승진 병목:")
+            for k, v in info["stats"].items():
+                label = STAT_LABELS.get(k, k)
+                mark = " ← 미달" if k in info["bottlenecks"] else " ✓"
+                lines.append(f"    {label}: {v['value']} / {v['required']}{mark}")
+
+    elif state.is_resigned:
+        info = env.analyze_resignation()
+        if info["reason"] == "번아웃":
+            lines.append(f"  원인: 번아웃 (극한 상태 {info['duration']}일 연속)")
+        else:
+            lines.append(f"  원인: 만성 스트레스 (고스트레스 누적 {info['duration']}일)")
+        lines.append(f"    스트레스: {info['stress']}  체력: {info['energy']}")
+
+    # 공통: 최종 스탯 요약
+    lines.append(f"  최종 상태: {state.position} / 연봉 {state.salary:,}원")
+    lines.append(
+        f"    능력:{state.skill:.0f} 성과:{state.performance:.0f} "
+        f"상사:{state.boss_favor:.0f} 동료:{state.peer_relation:.0f} "
+        f"평판:{state.reputation:.0f} 정치:{state.political_skill:.0f} "
+        f"스트레스:{state.stress:.0f} 체력:{state.energy:.0f}"
+    )
+    return "\n".join(lines)
+
+
+def _format_promotion_analysis(env) -> str:
+    """승진 시 어떤 스탯이 강점이었는지 분석 텍스트."""
+    info = env.analyze_promotion()
+    lines = ["  승진 심사:"]
+    for k, v in info["stats"].items():
+        label = STAT_LABELS.get(k, k)
+        surplus = v["value"] - v["required"]
+        bar = "★" if k == info["strength"] else " "
+        lines.append(f"   {bar} {label}: {v['value']} / {v['required']} (+{surplus:.0f})")
+    lines.append(f"  강점: {STAT_LABELS.get(info['strength'], info['strength'])}")
+    return "\n".join(lines)
+
+
+def _classify_outcome(state, observation: str) -> str | None:
+    """오늘 하루의 결과를 분류한다. 중요하지 않으면 None 반환."""
+    obs_lower = observation
+    # 승진
+    if "승진!" in obs_lower:
+        return f"승진: {state.position}"
+    # 이직
+    if "이직!" in obs_lower:
+        return f"이직 (연봉 {state.salary:,}원)"
+    # 해고/퇴사
+    if state.is_fired:
+        return "해고됨"
+    if state.is_resigned:
+        return "자진퇴사"
+    # 랜덤 이벤트 발생
+    if state.events_today:
+        return f"이벤트: {', '.join(state.events_today)}"
+    # 위험 상태 진입 (스트레스 80+ 또는 체력 15 이하)
+    if state.stress >= 80 and state.energy <= 15:
+        return "번아웃 위기 (스트레스↑ 체력↓)"
+    if state.performance < 15 and state.boss_favor < 15:
+        return "해고 위기 (성과↓ 상사신뢰↓)"
+    # 평범한 날은 저장하지 않음
+    return None
+
+
+def _store_episode_if_important(agent, day: int, action: str, state, observation: str):
+    """중요한 날만 에피소딕 메모리에 저장한다."""
+    outcome = _classify_outcome(state, observation)
+    if outcome is None:
+        return
+    episode = Episode(
+        day=day,
+        action=action,
+        events=list(state.events_today),
+        outcome_summary=outcome,
+        state_snapshot={
+            "position": state.position,
+            "salary": state.salary,
+            "skill": round(state.skill, 1),
+            "performance": round(state.performance, 1),
+            "boss_favor": round(state.boss_favor, 1),
+            "stress": round(state.stress, 1),
+            "energy": round(state.energy, 1),
+        },
+    )
+    agent.memory.add(episode)
 
 
 def _stress_cause(state) -> str:
@@ -207,9 +338,10 @@ def _status_summary(state, burnout_counter: int) -> str:
     return "🙂 그럭저럭 버티는 중"
 
 
-def _build_result(agent_name: str, state, step_logs: list, max_days: int) -> dict:
+def _build_result(agent_name: str, state, step_logs: list, max_days: int,
+                   env=None) -> dict:
     survived_days = step_logs[-1]["day"] if step_logs else 0
-    return {
+    result = {
         "agent": agent_name,
         "survived_days": survived_days,
         "max_days": max_days,
@@ -223,3 +355,9 @@ def _build_result(agent_name: str, state, step_logs: list, max_days: int) -> dic
         "final_boss_favor": round(state.boss_favor, 1),
         "final_stress": round(state.stress, 1),
     }
+    # 종료 원인 분석 첨부
+    if env and (state.is_fired or state.is_resigned):
+        result["exit_analysis"] = (
+            env.analyze_fire() if state.is_fired else env.analyze_resignation()
+        )
+    return result

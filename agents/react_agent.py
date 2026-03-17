@@ -1,6 +1,7 @@
 from environment.state import GameState
 from environment.personality import Personality
 from llm.client import LLMClient
+from memory.compressor import compress_history
 from .base_agent import BaseAgent
 
 
@@ -37,6 +38,7 @@ BATCH_SYSTEM_PROMPT = """
 - '이직 준비를 한다'를 반복(10~15일)하면 이직 발생. 헤드헌터 연락 시 준비 기간 단축.
 - 같은 직급 2년 이상 정체 시 이직이 경력 돌파구가 될 수 있다.
 
+{memory_section}
 현재 상태를 보고 앞으로 {n}일간의 행동 계획을 세우세요.
 다음 형식으로 정확히 응답하세요:
 
@@ -53,7 +55,7 @@ Comment: (현재 상황에 대한 한국 직장인 스타일의 한줄 독백. 1
 
 
 class ReActAgent(BaseAgent):
-    """Agent A: 단순 ReAct (Thought → Action, 메모리/플랜 없음)."""
+    """ReAct 에이전트: Thought → Action + 에피소딕 메모리 & 히스토리 압축."""
 
     base_name = "ReAct"
 
@@ -76,8 +78,30 @@ class ReActAgent(BaseAgent):
         response = self.llm.call(system=self._system, messages=messages)
         return self._parse_action(response)
 
+    def _build_memory_section(self) -> str:
+        """에피소딕 메모리 + 히스토리 압축을 프롬프트용 텍스트로 조합한다."""
+        parts = []
+
+        # 에피소딕 메모리: 최근 중요 사건 10개
+        memory_text = self.memory.to_text(n=10)
+        if memory_text != "기억 없음":
+            parts.append(f"[ 과거 주요 경험 ]\n{memory_text}")
+
+        # 히스토리 압축: 최근 30일 행동 패턴 요약 (LLM 호출)
+        if len(self.history) >= 30:
+            summary = compress_history(self.history, self.llm, window=30)
+            if summary:
+                parts.append(f"[ 최근 행동 패턴 요약 ]\n{summary}")
+
+        if not parts:
+            return ""
+        return "\n\n".join(parts)
+
     def decide_batch(self, state: GameState, observation: str, n: int) -> list[str]:
-        system = self._batch_system_template.format(n=n, actions=self._actions_list())
+        memory_section = self._build_memory_section()
+        system = self._batch_system_template.format(
+            n=n, actions=self._actions_list(), memory_section=memory_section,
+        )
         messages = [{"role": "user", "content": observation}]
         response = self.llm.call(system=system, messages=messages, max_tokens=64 * n)
         actions, comment = self._parse_batch(response, n)
