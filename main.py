@@ -16,7 +16,6 @@ from evaluation.metrics import compare_agents
 
 
 # ── 실험 설정 ──────────────────────────────────────────
-AUTO_VISUALIZE     = True   # 시뮬레이션 종료 후 비교 차트 HTML 자동 생성 여부
 EXPERIMENT_SEED    = 42     # 모든 에이전트가 동일한 이벤트 시퀀스를 경험 (랜덤 이벤트 순서를 고정하는 값) : 값 자체는 아무 숫자나 상관없고, 바꾸면 이벤트 순서가 달라짐
 MAX_DAYS           = 7300   # 시뮬레이션 최대 기간 (일) — 20년
 LOG_INTERVAL       = 30     # 콘솔 출력 주기 (일) — 분기마다
@@ -34,7 +33,6 @@ ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워
 # ── A/B 비교 실험 설정 ────────────────────────────────────
 # 특정 성향의 Reflection on/off를 나란히 비교하려면 여기에 성향명 추가
 # 예: ["정치형"] → 정치형(Reflection) vs 정치형(NoReflect) 동시 실행
-# 빈 리스트면 A/B 비교 없이 일반 모드로 실행
 AB_COMPARE = ["정치형"]
 # ────────────────────────────────────────────────────────
 
@@ -129,7 +127,7 @@ def main():
         )
 
     # 비교 차트 HTML 생성 (브라우저 자동 열기 없음)
-    if AUTO_VISUALIZE:
+    if globals().get("AUTO_VISUALIZE", True):
         from pathlib import Path
         from visualize_plotly import draw_comparison_html
         log_paths = [Path(r["log_path"]) for r in results if "log_path" in r]

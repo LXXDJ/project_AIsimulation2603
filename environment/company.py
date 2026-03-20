@@ -553,9 +553,6 @@ class CompanyEnvironment:
             return False
         if self.state.day < 12 * 365:
             return False
-        # 임원은 희망퇴직 안 함
-        if self.state.position_level >= 6:  # 임원
-            return False
         # 연 1회 1월 1일에만 판정
         day_in_year = self.state.day % 365
         if day_in_year != 1:
@@ -573,11 +570,15 @@ class CompanyEnvironment:
         elif years >= 12:
             base_prob = 0.04
 
-        # 직급 낮을수록 확률 상승 (부장 미만이면 의미 있게 증가)
+        # 직급별 확률 보정 (낮을수록 ↑, 높을수록 ↓)
         if self.state.position_level <= 2:  # 과장 이하
             base_prob += 0.12
         elif self.state.position_level <= 3:  # 차장
             base_prob += 0.05
+        elif self.state.position_level == 5:  # 이사
+            base_prob *= 0.7
+        elif self.state.position_level >= 6:  # 임원
+            base_prob *= 0.4
 
         # 스트레스/체력 보정
         if self.state.stress >= 60:
@@ -598,6 +599,54 @@ class CompanyEnvironment:
                 base_prob *= 0.5   # 정치형도 자리 유지 성향
 
         return self.rng.random() < base_prob
+
+    def _analyze_voluntary_factor(self) -> str:
+        """희망퇴직의 가장 큰 요인 1개를 반환."""
+        s = self.state
+        candidates = []  # (우선순위 점수, 요인 텍스트)
+
+        # 1. 스트레스 누적
+        if self._chronic_stress_days >= 90:
+            candidates.append((4, f"스트레스 누적 {self._chronic_stress_days}일"))
+        elif s.stress >= 60:
+            candidates.append((2, f"높은 스트레스 ({s.stress:.0f})"))
+
+        # 2. 직급 정체
+        days_at_pos = s.day - s.position_entry_day
+        years_at_pos = days_at_pos // 365
+        if years_at_pos >= 5:
+            candidates.append((5, f"직급 정체 {years_at_pos}년 ({s.position})"))
+        elif years_at_pos >= 3:
+            candidates.append((3, f"직급 정체 {years_at_pos}년 ({s.position})"))
+
+        # 3. 체력 저하
+        if s.energy <= 30:
+            candidates.append((4, f"체력 저하 ({s.energy:.0f})"))
+        elif s.energy <= 50:
+            candidates.append((2, f"체력 저하 ({s.energy:.0f})"))
+
+        # 4. 승진 가망 없음 (다음 직급 요건과 갭)
+        from environment.company import PROMOTION_REQUIREMENTS, POSITIONS
+        pos_idx = POSITIONS.index(s.position) if s.position in POSITIONS else -1
+        if pos_idx >= 0 and pos_idx < len(POSITIONS) - 1:
+            next_pos = POSITIONS[pos_idx + 1]
+            req = PROMOTION_REQUIREMENTS.get(next_pos, {})
+            gaps = []
+            for stat_key in ("skill", "performance", "boss_favor", "reputation"):
+                req_val = req.get(stat_key, 0)
+                cur_val = getattr(s, stat_key, 0)
+                if cur_val < req_val:
+                    gaps.append(req_val - cur_val)
+            if gaps and max(gaps) >= 20:
+                candidates.append((5, "승진 가망 없음"))
+            elif gaps and max(gaps) >= 10:
+                candidates.append((3, "승진 가망 낮음"))
+
+        if not candidates:
+            return "개인 사유"
+        # 우선순위순 정렬 후 전부 나열
+        candidates.sort(key=lambda x: -x[0])
+        return ", ".join(c[1] for c in candidates)
 
     def _check_fired(self) -> str:
         """해고 사유를 문자열로 반환. 해고 아니면 빈 문자열."""
@@ -726,6 +775,8 @@ class CompanyEnvironment:
             }
         else:
             years = s.day // 365
+            # 희망퇴직 요인 분석 (실제 스탯 기반)
+            factor = self._analyze_voluntary_factor()
             return {
                 "reason": "희망퇴직",
                 "detail": f"경력 {years}년차 {s.position} — 자발적으로 희망퇴직을 선택",
@@ -733,4 +784,5 @@ class CompanyEnvironment:
                 "career_years": years,
                 "stress": round(s.stress, 1),
                 "energy": round(s.energy, 1),
+                "voluntary_factor": factor,
             }

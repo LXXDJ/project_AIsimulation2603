@@ -364,8 +364,9 @@ def _status_summary(state, burnout_counter: int) -> str:
 def _build_result(agent_name: str, state, step_logs: list, max_days: int,
                    env=None) -> dict:
     survived_days = step_logs[-1]["day"] if step_logs else 0
-    # 정년퇴직: MAX_DAYS까지 생존한 경우
-    is_retired = (survived_days >= max_days and not state.is_fired and not state.is_resigned)
+    # 정년퇴직: MAX_DAYS까지 생존한 경우 (임원은 정년 없음 → 현직 유지)
+    reached_end = (survived_days >= max_days and not state.is_fired and not state.is_resigned)
+    is_retired = reached_end and state.position != "임원"
     result = {
         "agent": agent_name,
         "survived_days": survived_days,
@@ -391,6 +392,14 @@ def _build_result(agent_name: str, state, step_logs: list, max_days: int,
         result["exit_analysis"] = {
             "reason": "정년퇴직",
             "detail": f"경력 {years}년 — {state.position}으로 정년퇴직",
+            "position": state.position,
+            "career_years": years,
+        }
+    elif reached_end and state.position == "임원":
+        years = survived_days // 365
+        result["exit_analysis"] = {
+            "reason": "현직유지",
+            "detail": f"경력 {years}년 — 임원 현직 유지",
             "position": state.position,
             "career_years": years,
         }
