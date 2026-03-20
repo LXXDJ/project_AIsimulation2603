@@ -132,6 +132,34 @@ def load_log(path: Path) -> tuple[dict, list[dict]]:
         result["_promotions_log"] = extra["_promotions_log"]
     if extra["_reflections"]:
         result["_reflections"] = extra["_reflections"]
+    # result 레코드가 없거나 불완전한 경우 steps에서 보완
+    if steps:
+        last = steps[-1]
+        if not result.get("final_position"):
+            result["final_position"] = last.get("position", "?")
+        if not result.get("final_salary"):
+            result["final_salary"] = last.get("salary", 0)
+        if result.get("survived_days") is None:
+            result["survived_days"] = last.get("day", len(steps))
+        if not result.get("agent"):
+            # meta 행에서 가져올 수도 있지만, 파일명에서 추출
+            result["agent"] = path.stem
+        # is_fired/is_resigned/is_retired 미설정 시 exit_log에서 추론
+        if result.get("is_fired") is None and result.get("is_resigned") is None:
+            if exit_log:
+                reason = (exit_log.get("analysis") or {}).get("reason", "")
+                if reason in ("성과_부진", "승진_미달", "번아웃", "만성_스트레스"):
+                    result["is_fired"] = True
+                    result["is_resigned"] = False
+                    result["is_retired"] = False
+                    if not result.get("exit_analysis"):
+                        result["exit_analysis"] = exit_log.get("analysis", {})
+                elif reason == "희망퇴직":
+                    result["is_fired"] = False
+                    result["is_resigned"] = True
+                    result["is_retired"] = False
+                    if not result.get("exit_analysis"):
+                        result["exit_analysis"] = exit_log.get("analysis", {})
     return result, steps
 
 
@@ -194,7 +222,9 @@ def _exit_reason_text(result: dict) -> str:
     elif reason == "만성_스트레스":
         return f"원인: 만성 스트레스 (누적 {analysis.get('duration', '?')}일)<br>  스트레스: {analysis.get('stress', '?')} / 체력: {analysis.get('energy', '?')}"
     elif reason == "희망퇴직":
-        return f"원인: 희망퇴직 (경력 {analysis.get('career_years', '?')}년차 {analysis.get('position', '?')})"
+        factor = analysis.get("voluntary_factor", "")
+        factor_str = f" — {factor}" if factor else ""
+        return f"원인: 희망퇴직 (경력 {analysis.get('career_years', '?')}년차 {analysis.get('position', '?')}){factor_str}"
     elif reason == "정년퇴직":
         return f"경력 {analysis.get('career_years', '?')}년 — {analysis.get('position', '?')}으로 정년퇴직"
     return ""
@@ -268,7 +298,7 @@ def _hover_text(s: dict, personality: str = "") -> str:
 
 
 def _build_milestones(steps: list[dict], result: dict | None = None,
-                      duration: int = 7) -> list[str]:
+                      duration: int = 30) -> list[str]:
     """승진/이직/퇴사 발생 후 duration일간 마일스톤 텍스트를 표시한다."""
     milestones = [""] * len(steps)
     if not steps:
@@ -287,7 +317,8 @@ def _build_milestones(steps: list[dict], result: dict | None = None,
             events.append((idx, "◆ 이직 발생"))
             prev_jc = cur_jc
 
-    # 퇴사/해고 마일스톤 (마지막 스텝)
+    # 퇴사/해고/종료 마일스톤 (마지막 스텝 — 역방향 duration)
+    end_text = None
     if result:
         analysis = result.get("exit_analysis") or {}
         if not analysis:
@@ -299,16 +330,34 @@ def _build_milestones(steps: list[dict], result: dict | None = None,
             "번아웃": "번아웃", "만성_스트레스": "만성 스트레스",
             "희망퇴직": "희망퇴직",
         }
-        if reason in reason_map:
-            events.append((len(steps) - 1, f"✕ 퇴사 발생 : {reason_map[reason]}"))
+        if reason == "현직유지":
+            end_text = "👔 현직 유지 (임원)"
+        elif reason == "희망퇴직":
+            factor = analysis.get("voluntary_factor", "")
+            factor_str = f" — {factor}" if factor else ""
+            end_text = f"✕ 퇴사 발생 : 희망퇴직({factor_str.lstrip(' — ')})" if factor else "✕ 퇴사 발생 : 희망퇴직"
+        elif reason in reason_map:
+            end_text = f"✕ 퇴사 발생 : {reason_map[reason]}"
+        elif result.get("is_retired"):
+            end_text = "🎉 정년퇴직"
+        elif not reason:
+            final_pos = result.get("final_position", steps[-1].get("position", "?"))
+            if final_pos == "임원":
+                end_text = f"👔 현직 유지 ({final_pos})"
+            else:
+                end_text = f"🎉 정년퇴직 ({final_pos})"
 
-    # 각 이벤트를 발생일부터 duration일간 표시
+    # 일반 이벤트: 발생일부터 duration일간 표시 (새 이벤트가 이전 것을 덮어씀)
     for evt_idx, text in events:
         for d in range(evt_idx, min(evt_idx + duration, len(steps))):
-            if milestones[d]:
-                milestones[d] += f"<br>{text}"
-            else:
-                milestones[d] = text
+            milestones[d] = text
+
+    # 종료 마일스톤: 마지막 duration일 동안 역방향으로 표시
+    if end_text:
+        start = max(0, len(steps) - duration)
+        for d in range(start, len(steps)):
+            milestones[d] = end_text
+
     return milestones
 
 
@@ -730,20 +779,24 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             hoverinfo="skip",
         ), row=1, col=1)
 
-        # 범례에 최종 결과 표시
+        # 범례에 최종 결과 표시 (모든 에이전트에 종료 사유 + 직급)
         r_data = d["result"]
+        final_pos = r_data.get("final_position", "")
         exit_reason = (r_data.get("exit_analysis") or {}).get("reason", "")
         if r_data.get("is_fired"):
-            legend_suffix = " (해고)"
+            reason_map = {"성과_부진": "성과부진", "승진_미달": "승진미달",
+                          "번아웃": "번아웃", "만성_스트레스": "만성스트레스"}
+            reason_text = reason_map.get(exit_reason, "해고")
+            legend_suffix = f" ({final_pos}/{reason_text})" if final_pos else f" ({reason_text})"
         elif exit_reason == "희망퇴직":
-            legend_suffix = " (희망퇴직)"
+            legend_suffix = f" ({final_pos}/희망퇴직)" if final_pos else " (희망퇴직)"
         elif r_data.get("is_resigned"):
-            legend_suffix = " (퇴사)"
+            legend_suffix = f" ({final_pos}/퇴사)" if final_pos else " (퇴사)"
         elif r_data.get("is_retired"):
-            final_pos = r_data.get("final_position", "")
-            legend_suffix = f" (정년퇴직/{final_pos})"
+            legend_suffix = f" ({final_pos}/정년퇴직)"
+        elif exit_reason == "현직유지":
+            legend_suffix = f" ({final_pos}/현직유지)"
         else:
-            final_pos = r_data.get("final_position", "")
             legend_suffix = f" ({final_pos})" if final_pos else ""
         legend_name = d["display"] + legend_suffix
 
@@ -1027,6 +1080,44 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
     names_tag = "_".join(d["display"] for d in datasets)
     out_path  = Path(log_paths[0]).parent / f"{_dt.now().strftime('%y%m%d_%H%M%S')}_comparison_{names_tag}.html"
 
+    # 각 에이전트의 종료 카드 미리 생성 (color → final card HTML)
+    import html as _html
+    end_cards_js = {}
+    for i, d in enumerate(datasets):
+        color = AGENT_PALETTE[i % len(AGENT_PALETTE)]
+        last_step = d["steps"][-1]
+        r_data = d["result"]
+        # 종료 마일스톤 텍스트
+        analysis = r_data.get("exit_analysis") or {}
+        if not analysis:
+            log = r_data.get("_exit_log", {})
+            analysis = log.get("analysis", {})
+        reason = analysis.get("reason", "")
+        final_pos = r_data.get("final_position", last_step.get("position", "?"))
+        if reason == "현직유지" or (not reason and final_pos == "임원"):
+            end_milestone = "👔 현직 유지 (임원)"
+        elif reason in ("성과_부진", "승진_미달", "번아웃", "만성_스트레스"):
+            reason_kr = {"성과_부진": "성과 부진", "승진_미달": "승진 미달",
+                         "번아웃": "번아웃", "만성_스트레스": "만성 스트레스"}[reason]
+            end_milestone = f"✕ 퇴사 발생 : {reason_kr}"
+        elif reason == "희망퇴직":
+            factor = analysis.get("voluntary_factor", "")
+            end_milestone = f"✕ 퇴사 발생 : 희망퇴직({factor})" if factor else "✕ 퇴사 발생 : 희망퇴직"
+        elif r_data.get("is_retired"):
+            end_milestone = "🎉 정년퇴직"
+        else:
+            end_milestone = f"🎉 정년퇴직 ({final_pos})"
+
+        survived = r_data.get("survived_days", last_step.get("day", 0))
+        ea = analysis if analysis else None
+        end_hover = _hover_text_comparison(
+            last_step, display_name=d["display"],
+            milestone=end_milestone, exit_analysis=ea,
+            agent_color=color, survived_days=survived)
+        end_card_html = (f'<div class="info-card" style="border-left:4px solid {color};">'
+                         f'{end_hover}</div>')
+        end_cards_js[color] = end_card_html.replace("'", "\\'").replace("\n", "")
+
     # 커스텀 HTML: 차트 70% + 호버 정보 패널 30% 고정 레이아웃
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="chart")
     custom_html = f"""<!DOCTYPE html>
@@ -1073,32 +1164,56 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
   var chartDiv = document.getElementById('chart');
   var infoContent = document.getElementById('info-content');
 
+  // 에이전트별 종료 카드 (미리 생성)
+  var endCards = {{{', '.join(f"'{k}': '{v}'" for k, v in end_cards_js.items())}}};
+  // 에이전트가 한번이라도 호버에 등장했는지 추적
+  var seenAgents = {{}};
+
+  function buildCard(txt) {{
+    var isReflect = txt.includes('자기성찰');
+    var cls = isReflect ? 'info-card reflect' : 'info-card';
+    var colorMatch = txt.match(/data-color='([^']+)'/);
+    var borderStyle = colorMatch ? 'border-left:4px solid ' + colorMatch[1] + ';' : '';
+    return '<div class="' + cls + '" style="' + borderStyle + '">' + txt + '</div>';
+  }}
+
+  function getAgentKey(txt) {{
+    // data-survived + data-color 조합으로 에이전트 식별
+    var cm = txt.match(/data-color='([^']+)'/);
+    return cm ? cm[1] : '';
+  }}
+
   chartDiv.on('plotly_hover', function(data) {{
-    var cards = [];
+    var currentCards = {{}};
     data.points.forEach(function(pt) {{
       var txt = pt.hovertext || pt.text || '';
       if (!txt || txt === 'undefined') return;
-      // 성찰 마커인지 확인
-      var isReflect = txt.includes('자기성찰');
-      var cls = isReflect ? 'info-card reflect' : 'info-card';
-      // data-color 추출하여 테두리 색상 적용
-      var colorMatch = txt.match(/data-color='([^']+)'/);
-      var borderStyle = colorMatch ? 'border-left:4px solid ' + colorMatch[1] + ';' : '';
-      cards.push('<div class="' + cls + '" style="' + borderStyle + '">' + txt + '</div>');
+      if (txt.includes('자기성찰')) return;
+      var key = getAgentKey(txt);
+      if (key) {{
+        currentCards[key] = buildCard(txt);
+        seenAgents[key] = true;
+      }}
     }});
-    if (cards.length > 0) {{
-      // data-survived 기준 내림차순 정렬 (오래 생존한 성향이 위)
-      cards.sort(function(a, b) {{
+    // 현재 호버에 없지만 이전에 등장한 에이전트 → 종료 카드 표시
+    Object.keys(seenAgents).forEach(function(key) {{
+      if (!currentCards[key] && endCards[key]) {{
+        currentCards[key] = endCards[key];
+      }}
+    }});
+    var allCards = Object.values(currentCards);
+    if (allCards.length > 0) {{
+      allCards.sort(function(a, b) {{
         var sa = (a.match(/data-survived='(\d+)'/) || [0,0])[1];
         var sb = (b.match(/data-survived='(\d+)'/) || [0,0])[1];
         return Number(sb) - Number(sa);
       }});
-      infoContent.innerHTML = cards.join('');
+      infoContent.innerHTML = allCards.join('');
     }}
   }});
 
   chartDiv.on('plotly_unhover', function() {{
-    // 호버 해제 시 마지막 내용 유지 (지우지 않음)
+    // 호버 해제 시 마지막 내용 유지
   }});
 </script>
 </body></html>"""
