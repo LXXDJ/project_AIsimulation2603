@@ -114,16 +114,20 @@ class CompanyEnvironment:
         # 설계: performance 평형점 ≈ skill + 5 (프로젝트집중 0.05/0.01), boss_favor는 적극 관리 필요
         # 성향마다 다른 스탯이 병목이 됨: 성과형→boss_favor, 사교형→performance, 균형형→균형
         self.promotion_requirements = {
-            "사원": {"skill": 22, "performance": 30, "boss_favor": 40, "reputation": 20,
-                     "min_days": 365},   # 1년 잠금
+            "사원": {"skill": 22, "performance": 30, "boss_favor": 40, "reputation": 12,
+                     "min_days": 365},   # 1년
             "대리": {"skill": 32, "performance": 42, "boss_favor": 48, "reputation": 35,
-                     "min_days": 1095},  # 3년 잠금
+                     "min_days": 1095},  # 3년
             "과장": {"skill": 42, "performance": 52, "boss_favor": 53, "reputation": 45,
-                     "min_days": 1825},  # 5년 잠금
+                     "min_days": 1825},  # 5년
             "차장": {"skill": 50, "performance": 60, "boss_favor": 58, "reputation": 55,
-                     "min_days": 2555},  # 7년 잠금
+                     "min_days": 2555},  # 7년
             "부장": {"skill": 56, "performance": 66, "boss_favor": 62, "reputation": 62,
-                     "min_days": 3100},  # 8.5년 잠금
+                     "min_days": 3285},  # 9년
+            "이사": {"skill": 60, "performance": 68, "boss_favor": 66, "reputation": 65,
+                     "min_days": 4745},  # 13년
+            "임원": {"skill": 65, "performance": 72, "boss_favor": 72, "reputation": 70,
+                     "min_days": 5840},  # 16년
         }
 
     def reset(self) -> GameState:
@@ -173,13 +177,17 @@ class CompanyEnvironment:
 
         self.state.clamp_all()
 
-        # 번아웃 / 만성스트레스 / 해고 판정 (주말에도 유효)
+        # 번아웃 / 만성스트레스 / 희망퇴직 / 해고 판정 (주말에도 유효)
         if self._check_burnout():
             self.state.is_resigned = True
             log_lines.append(f"결과: 번아웃으로 자진퇴사했다. (극한 상태 {self._burnout_counter}일 지속)")
         elif self._check_chronic_stress():
             self.state.is_resigned = True
             log_lines.append(f"결과: 만성 스트레스로 자진퇴사했다. (고스트레스 누적 {self._chronic_stress_days}일)")
+        elif self._check_voluntary_retirement():
+            self.state.is_resigned = True
+            years = self.state.day // 365
+            log_lines.append(f"결과: 경력 {years}년차 — 희망퇴직을 선택했다.")
         else:
             fire_reason = self._check_fired()
             if fire_reason:
@@ -247,13 +255,17 @@ class CompanyEnvironment:
         # 4. 수치 범위 클램프
         self.state.clamp_all()
 
-        # 5. 번아웃 / 만성스트레스 판정 (해고보다 먼저)
+        # 5. 번아웃 / 만성스트레스 / 희망퇴직 판정 (해고보다 먼저)
         if self._check_burnout():
             self.state.is_resigned = True
             log_lines.append(f"결과: 번아웃으로 자진퇴사했다. (극한 상태 {self._burnout_counter}일 지속)")
         elif self._check_chronic_stress():
             self.state.is_resigned = True
             log_lines.append(f"결과: 만성 스트레스로 자진퇴사했다. (고스트레스 누적 {self._chronic_stress_days}일)")
+        elif self._check_voluntary_retirement():
+            self.state.is_resigned = True
+            years = self.state.day // 365
+            log_lines.append(f"결과: 경력 {years}년차 — 희망퇴직을 선택했다.")
 
         # 6. 해고 판정
         else:
@@ -272,16 +284,21 @@ class CompanyEnvironment:
                 old_pos = self.state.position
                 idx = POSITIONS.index(self.state.position)
                 self.state.position = POSITIONS[idx + 1]
-                self.state.salary = int(self.state.salary * 1.15)
+                # 직급별 승진 인상률 (임원급은 대폭 인상)
+                raise_by_pos = {"대리": 1.10, "과장": 1.12, "차장": 1.15,
+                                "부장": 1.20, "이사": 1.35, "임원": 1.50}
+                raise_rate = raise_by_pos.get(self.state.position, 1.15)
+                self.state.salary = int(self.state.salary * raise_rate)
                 # 직급별 재승진 대기 기간 (새 직급 기준)
-                cooldown_by_pos = {"대리": 180, "과장": 365, "차장": 365, "부장": 545, "이사": 730}
+                cooldown_by_pos = {"대리": 180, "과장": 365, "차장": 365, "부장": 545, "이사": 730, "임원": 1095}
                 self._promotion_cooldown = cooldown_by_pos.get(self.state.position, 0)
                 # 승진 시 연차 즉시 재계산 (직급 보너스 반영)
                 new_leave = self._calc_annual_leave()
                 added = new_leave - self.state.annual_leave
                 self.state.annual_leave = new_leave
                 bonus_str = f" (+{added}일 연차 추가)" if added > 0 else ""
-                log_lines.append(f"결과: {old_pos} → {self.state.position} 승진! 연봉 15% 인상.{bonus_str}")
+                raise_pct = int((raise_rate - 1) * 100)
+                log_lines.append(f"결과: {old_pos} → {self.state.position} 승진! 연봉 {raise_pct}% 인상.{bonus_str}")
                 self.state.position_entry_day = self.state.day  # 직급 진입일 갱신
 
             else:
@@ -520,35 +537,92 @@ class CompanyEnvironment:
         return self._chronic_stress_days >= 180
 
     # 총 경력(day) 대비 최소 직급 — 이 경력에서 해당 직급 이하면 권고사직
-    # (경력 기준일, 최소 직급 인덱스)  직급: 사원=0, 대리=1, 과장=2, 차장=3, 부장=4, 이사=5
+    # (경력 기준일, 최소 직급 인덱스)  직급: 사원=0, 대리=1, 과장=2, 차장=3, 부장=4, 이사=5, 임원=6
     CAREER_POSITION_FLOOR = [
         (5 * 365,  1),   # 경력 5년 → 최소 대리
         (8 * 365,  2),   # 경력 8년 → 최소 과장
+        (15 * 365, 4),   # 경력 15년 → 최소 부장 (명예퇴직 압박)
     ]
+
+    def _check_voluntary_retirement(self) -> bool:
+        """경력 12년+ 시 성향·스탯에 따라 희망퇴직을 선택할 수 있다.
+        워라밸형은 확률↑, 성과형/정치형은 확률↓.
+        연 1회(1월) 판정, 직급이 낮을수록·스트레스 높을수록 확률 상승.
+        """
+        if self.state.is_fired or self.state.is_resigned:
+            return False
+        if self.state.day < 12 * 365:
+            return False
+        # 임원은 희망퇴직 안 함
+        if self.state.position_level >= 6:  # 임원
+            return False
+        # 연 1회 1월 1일에만 판정
+        day_in_year = self.state.day % 365
+        if day_in_year != 1:
+            return False
+
+        # 기본 확률 계산 (연 1회이므로 적절한 수준으로)
+        years = self.state.day // 365
+        base_prob = 0.0
+
+        # 경력이 길수록 기본 확률 상승
+        if years >= 18:
+            base_prob = 0.20
+        elif years >= 15:
+            base_prob = 0.10
+        elif years >= 12:
+            base_prob = 0.04
+
+        # 직급 낮을수록 확률 상승 (부장 미만이면 의미 있게 증가)
+        if self.state.position_level <= 2:  # 과장 이하
+            base_prob += 0.12
+        elif self.state.position_level <= 3:  # 차장
+            base_prob += 0.05
+
+        # 스트레스/체력 보정
+        if self.state.stress >= 60:
+            base_prob += 0.05
+        if self.state.energy <= 40:
+            base_prob += 0.03
+
+        # 성향 보정
+        if self.personality:
+            name = self.personality.name
+            if name == "워라밸형":
+                base_prob *= 2.5   # 워라밸형은 일찍 퇴직 경향
+            elif name == "사교형":
+                base_prob *= 1.3
+            elif name == "성과형":
+                base_prob *= 0.4   # 성과형은 끝까지 버팀
+            elif name == "정치형":
+                base_prob *= 0.5   # 정치형도 자리 유지 성향
+
+        return self.rng.random() < base_prob
 
     def _check_fired(self) -> str:
         """해고 사유를 문자열로 반환. 해고 아니면 빈 문자열."""
         if self.state.is_fired or self.state.is_resigned:
             return ""
-        # 입사(이직) 후 유예 기간 동안은 해고 없음
-        days_at_company = self.state.day - self.state.company_start_day
-        if days_at_company < PROBATION_DAYS:
-            return ""
 
-        # 1) 성과 + 상사 신뢰 동시 저조 → 해고
-        if (
-            self.state.performance < FIRE_THRESHOLD["performance"]
-            and self.state.boss_favor < FIRE_THRESHOLD["boss_favor"]
-        ):
-            return "성과 부진으로 해고되었다."
-
-        # 2) 총 경력 대비 직급 미달 → 권고사직 (이직으로 리셋 안 됨)
-        total_career = self.state.day  # day 1부터 시작 = 총 경력
+        # 1) 총 경력 대비 직급 미달 → 권고사직 (이직 유예와 무관하게 항상 체크)
+        total_career = self.state.day
         current_level = self.state.position_level
         for career_threshold, min_level in self.CAREER_POSITION_FLOOR:
             if total_career >= career_threshold and current_level < min_level:
                 years = total_career // 365
                 return f"경력 {years}년차 {self.state.position} — 승진 미달로 권고사직 처리되었다."
+
+        # 입사(이직) 후 유예 기간 동안은 성과 부진 해고 없음
+        days_at_company = self.state.day - self.state.company_start_day
+        if days_at_company < PROBATION_DAYS:
+            return ""
+
+        # 2) 성과 + 상사 신뢰 동시 저조 → 해고
+        if (
+            self.state.performance < FIRE_THRESHOLD["performance"]
+            and self.state.boss_favor < FIRE_THRESHOLD["boss_favor"]
+        ):
+            return "성과 부진으로 해고되었다."
 
         return ""
 
@@ -642,11 +716,21 @@ class CompanyEnvironment:
                 "energy": round(s.energy, 1),
                 "duration": self._burnout_counter,
             }
-        else:
+        elif self._chronic_stress_days >= 180:
             return {
                 "reason": "만성_스트레스",
                 "detail": f"스트레스 70+ 상태가 누적 {self._chronic_stress_days}일 (임계: 180일)",
                 "stress": round(s.stress, 1),
                 "energy": round(s.energy, 1),
                 "duration": self._chronic_stress_days,
+            }
+        else:
+            years = s.day // 365
+            return {
+                "reason": "희망퇴직",
+                "detail": f"경력 {years}년차 {s.position} — 자발적으로 희망퇴직을 선택",
+                "position": s.position,
+                "career_years": years,
+                "stress": round(s.stress, 1),
+                "energy": round(s.energy, 1),
             }

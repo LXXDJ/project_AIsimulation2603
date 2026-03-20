@@ -1,7 +1,7 @@
 from environment.state import POSITIONS
 
 _BASE_SALARY   = 36_000_000   # 입사 초봉
-_SALARY_RANGE  = 60_000_000   # 5년(1825일) 기준 최대 상승 폭 (임원 포함 상향)
+_SALARY_RANGE  = 264_000_000  # 임원 상한(3억) - 초봉(3600만) 기준 최대 상승 폭
 
 
 def compute_metrics(result: dict) -> dict:

@@ -99,14 +99,14 @@ PERSONALITIES: dict[str, Personality] = {
             "순수 업무 효율은 낮지만 승진 조건을 빠르게 충족시키는 데 유리하다."
         ),
         action_multipliers={
-            "정치적으로 행동한다": {"political_skill": 1.6, "boss_favor": 1.5},
+            "정치적으로 행동한다": {"political_skill": 1.6, "boss_favor": 1.5, "reputation": 0.0},
             "상사와 점심을 먹는다": {"boss_favor": 1.4, "political_skill": 1.3},
-            "동료를 도와준다":     {"reputation": 1.3, "peer_relation": 1.2},
-            "프로젝트에 집중한다": {"skill": 0.7, "performance": 0.8},
-            "야근한다":           {"skill": 0.6, "performance": 0.75},
-            "자기계발을 한다":     {"skill": 0.7},
+            "동료를 도와준다":     {"reputation": 1.4, "peer_relation": 1.2},
+            "프로젝트에 집중한다": {"skill": 0.85, "performance": 0.9},
+            "야근한다":           {"skill": 0.8, "performance": 0.85},
+            "자기계발을 한다":     {"skill": 0.85},
         },
-        initial_bonus={"political_skill": 25.0, "skill": -3.0, "performance": -2.0},
+        initial_bonus={"political_skill": 25.0, "skill": -2.0},
         event_tier_multipliers={"company": 1.5, "personal": 1.2},
         weekend_weights={"인맥관리": 5, "사교": 3, "휴식": 2, "자기계발": 1, "여행": 1},
         event_weights={
