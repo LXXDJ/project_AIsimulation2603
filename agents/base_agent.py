@@ -10,12 +10,14 @@ class BaseAgent(ABC):
 
     base_name: str = "BaseAgent"
 
-    def __init__(self, llm: LLMClient, personality: Personality | None = None):
+    def __init__(self, llm: LLMClient, personality: Personality | None = None,
+                 llm_reflect: LLMClient | None = None):
         self.llm = llm
+        self.llm_reflect = llm_reflect  # Reflection 전용 (고급 모델)
         self.personality = personality
         self.name = f"{self.base_name}_{personality.name}" if personality else self.base_name
         self.history: list[dict] = []   # {"day": int, "action": str, "observation": str}
-        self._last_comment: str = ""    # 배치 결정 시 LLM이 생성한 한줄 코멘트
+        self._reflection: str = ""      # 최근 자기성찰 결과
         self.memory = EpisodicMemory(capacity=50)  # 중요 사건 기억 저장소
 
     @abstractmethod
@@ -31,6 +33,7 @@ class BaseAgent(ABC):
 
     def reset(self):
         self.history = []
+        self._reflection = ""
         self.memory = EpisodicMemory(capacity=50)
 
     # ------------------------------------------------------------------

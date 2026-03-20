@@ -3,7 +3,7 @@ from openai import OpenAI
 
 
 class LLMClient:
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-4.1-mini"):
         self.model = model
         self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 

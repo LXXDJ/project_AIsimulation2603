@@ -52,10 +52,14 @@ _WEEKEND_ACTIONS = {"휴식", "자기계발", "사교", "인맥관리", "여행"
 
 
 def _display_name(name: str) -> str:
-    """에이전트 이름에서 접두사(ReAct_ 등) 제거."""
+    """에이전트 이름에서 타임스탬프·접두사(ReAct_ 등) 제거 → 성향명만 반환."""
+    import re
+    # 타임스탬프 패턴 제거 (예: 260320_162456_)
+    name = re.sub(r"^\d{6}_\d{6}_", "", name)
     for prefix in ("ReAct_", "Batch_", "Chain_", "React_"):
         if name.startswith(prefix):
-            return name[len(prefix):]
+            name = name[len(prefix):]
+            break
     return name
 
 
@@ -102,6 +106,8 @@ def _make_time_ticks(max_day: int) -> tuple[list[int], list[str]]:
 
 def load_log(path: Path) -> tuple[dict, list[dict]]:
     result, steps = {}, []
+    extra: dict[str, list] = {"_reflections": [], "_promotions_log": []}
+    exit_log = None
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -113,7 +119,85 @@ def load_log(path: Path) -> tuple[dict, list[dict]]:
                 result = {k: v for k, v in obj.items() if k != "type"}
             elif t == "step":
                 steps.append({k: v for k, v in obj.items() if k != "type"})
+            elif t == "exit":
+                exit_log = obj
+            elif t == "promotion":
+                extra["_promotions_log"].append(obj)
+            elif t == "reflection":
+                extra["_reflections"].append(obj)
+    # result 덮어쓰기 이후에 부가 데이터 병합
+    if exit_log:
+        result["_exit_log"] = exit_log
+    if extra["_promotions_log"]:
+        result["_promotions_log"] = extra["_promotions_log"]
+    if extra["_reflections"]:
+        result["_reflections"] = extra["_reflections"]
     return result, steps
+
+
+_STAT_LABELS = {
+    "skill": "업무능력", "performance": "성과",
+    "boss_favor": "상사신뢰", "reputation": "평판",
+}
+
+
+def _extract_reflection_label(text: str) -> str:
+    """성찰 텍스트의 '문제점:' 줄에서 핵심 키워드를 추출한다."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("문제점:") or stripped.startswith("문제점 :"):
+            content = stripped.split(":", 1)[1].strip()
+            # 괄호 안 수치 제거하고 핵심만 추출
+            # 너무 길면 15자로 자름
+            if len(content) > 18:
+                content = content[:18] + "…"
+            return content
+    # 문제점이 없으면 개선 줄 시도
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("개선:") or stripped.startswith("개선 :"):
+            content = stripped.split(":", 1)[1].strip()
+            if len(content) > 18:
+                content = content[:18] + "…"
+            return content
+    return ""
+
+
+def _exit_reason_text(result: dict) -> str:
+    """result 딕셔너리에서 해고/퇴사 원인 텍스트를 생성한다."""
+    # exit_analysis (result에 직접 포함) 또는 _exit_log (JSONL exit 레코드) 참조
+    analysis = result.get("exit_analysis") or {}
+    if not analysis:
+        log = result.get("_exit_log", {})
+        analysis = log.get("analysis", {})
+    if not analysis:
+        return ""
+
+    reason = analysis.get("reason", "")
+    if reason == "성과_부진":
+        lines = ["원인: 성과 + 상사신뢰 동시 저조"]
+        for k, v in analysis.get("stats", {}).items():
+            label = _STAT_LABELS.get(k, k)
+            lines.append(f"  {label}: {v['value']} (기준: {v['threshold']} 미만)")
+        return "<br>".join(lines)
+    elif reason == "승진_미달":
+        target = analysis.get("target_position", "?")
+        lines = [f"원인: 경력 대비 직급 미달 (요구: {target})"]
+        for k, v in analysis.get("stats", {}).items():
+            label = _STAT_LABELS.get(k, k)
+            bottlenecks = analysis.get("bottlenecks", [])
+            mark = " ← 미달" if k in bottlenecks else " ✓"
+            lines.append(f"  {label}: {v['value']}/{v['required']}{mark}")
+        return "<br>".join(lines)
+    elif reason == "번아웃":
+        return f"원인: 번아웃 ({analysis.get('duration', '?')}일 연속)<br>  스트레스: {analysis.get('stress', '?')} / 체력: {analysis.get('energy', '?')}"
+    elif reason == "만성_스트레스":
+        return f"원인: 만성 스트레스 (누적 {analysis.get('duration', '?')}일)<br>  스트레스: {analysis.get('stress', '?')} / 체력: {analysis.get('energy', '?')}"
+    elif reason == "희망퇴직":
+        return f"원인: 희망퇴직 (경력 {analysis.get('career_years', '?')}년차 {analysis.get('position', '?')})"
+    elif reason == "정년퇴직":
+        return f"경력 {analysis.get('career_years', '?')}년 — {analysis.get('position', '?')}으로 정년퇴직"
+    return ""
 
 
 # ── 한 줄 요약 (rule-based) ───────────────────────────────────────────────────
@@ -156,27 +240,166 @@ def _one_line_summary(s: dict) -> str:
 
 
 def _hover_text(s: dict, personality: str = "") -> str:
+    """단일 차트용 호버 텍스트."""
     events_str = ", ".join(s.get("events", [])) or "없음"
-    summary = s.get("comment") or _one_line_summary(s)
+    summary = _one_line_summary(s)
+    score = _composite_score(s)
     job_changes = s.get("job_changes", 0)
-    job_str = f"  |  이직: {job_changes}회" if job_changes > 0 else ""
-    personality_str = f"  |  성향: {personality}" if personality else ""
+    job_str = f" / 이직 {job_changes}회" if job_changes > 0 else ""
+    sep = "─" * 27
     return (
-        f"<b>Day {s['day']}</b>  {s['position']}{job_str}{personality_str}<br>"
+        f"<b>{personality}</b> ({s['position']}{job_str})<br>"
         f"행동: {s['action']}<br>"
-        f"─────────────────<br>"
-        f"성과: {s.get('performance', 0):.0f}  |  "
-        f"상사 호감: {s.get('boss_favor', 0):.0f}  |  "
+        f"<i>{summary}</i><br>"
+        f"{sep}<br>"
+        f"• 연봉: {s['salary']:,}원<br>"
+        f"• 이벤트: {events_str}<br>"
+        f"{sep}<br>"
+        f"성과: {s.get('performance', 0):.0f}  │  "
+        f"상사호감: {s.get('boss_favor', 0):.0f}  │  "
         f"업무능력: {s.get('skill', 0):.0f}<br>"
-        f"동료 관계: {s.get('peer_relation', 0):.0f}  |  "
-        f"평판: {s.get('reputation', 0):.0f}  |  "
+        f"동료관계: {s.get('peer_relation', 0):.0f}  │  "
+        f"평판: {s.get('reputation', 0):.0f}  │  "
         f"정치력: {s.get('political_skill', 0):.0f}<br>"
-        f"스트레스: {s.get('stress', 0):.0f}  |  "
-        f"체력: {s.get('energy', 0):.0f}<br>"
-        f"연봉: {s['salary']:,}원<br>"
+        f"스트레스: {s.get('stress', 0):.0f}  │  "
+        f"체력: {s.get('energy', 0):.0f}  │  "
+        f"<b>총점: {score:.0f}</b>"
+    )
+
+
+def _build_milestones(steps: list[dict], result: dict | None = None,
+                      duration: int = 7) -> list[str]:
+    """승진/이직/퇴사 발생 후 duration일간 마일스톤 텍스트를 표시한다."""
+    milestones = [""] * len(steps)
+    if not steps:
+        return milestones
+
+    # 이벤트 발생 지점 탐지
+    events: list[tuple[int, str]] = []  # (day_idx, text)
+    prev_pos = steps[0]["position"]
+    prev_jc = steps[0].get("job_changes", 0)
+    for idx, s in enumerate(steps):
+        if s["position"] != prev_pos:
+            events.append((idx, f"★ 승진 발생 : {prev_pos} → {s['position']}"))
+            prev_pos = s["position"]
+        cur_jc = s.get("job_changes", 0)
+        if cur_jc > prev_jc:
+            events.append((idx, "◆ 이직 발생"))
+            prev_jc = cur_jc
+
+    # 퇴사/해고 마일스톤 (마지막 스텝)
+    if result:
+        analysis = result.get("exit_analysis") or {}
+        if not analysis:
+            log = result.get("_exit_log", {})
+            analysis = log.get("analysis", {})
+        reason = analysis.get("reason", "")
+        reason_map = {
+            "성과_부진": "성과 부진", "승진_미달": "승진 미달",
+            "번아웃": "번아웃", "만성_스트레스": "만성 스트레스",
+            "희망퇴직": "희망퇴직",
+        }
+        if reason in reason_map:
+            events.append((len(steps) - 1, f"✕ 퇴사 발생 : {reason_map[reason]}"))
+
+    # 각 이벤트를 발생일부터 duration일간 표시
+    for evt_idx, text in events:
+        for d in range(evt_idx, min(evt_idx + duration, len(steps))):
+            if milestones[d]:
+                milestones[d] += f"<br>{text}"
+            else:
+                milestones[d] = text
+    return milestones
+
+
+def _exit_stat_html(analysis: dict) -> str:
+    """퇴사/해고 시 스탯 비교 테이블 HTML 생성 (3번째 열용)."""
+    reason = analysis.get("reason", "")
+    stats = analysis.get("stats", {})
+    if not stats:
+        # 번아웃/만성스트레스 — 스탯 테이블 대신 간단 표시
+        if reason == "번아웃":
+            return (f"<div style='font-size:11px;line-height:1.6;color:#C62828;'>"
+                    f"<b>번아웃</b> ({analysis.get('duration','?')}일)<br>"
+                    f"스트레스: {analysis.get('stress','?')}<br>"
+                    f"체력: {analysis.get('energy','?')}</div>")
+        elif reason == "만성_스트레스":
+            return (f"<div style='font-size:11px;line-height:1.6;color:#C62828;'>"
+                    f"<b>만성 스트레스</b> ({analysis.get('duration','?')}일)<br>"
+                    f"스트레스: {analysis.get('stress','?')}<br>"
+                    f"체력: {analysis.get('energy','?')}</div>")
+        return ""
+    bottlenecks = analysis.get("bottlenecks", [])
+    rows = ""
+    for k, v in stats.items():
+        label = _STAT_LABELS.get(k, k)
+        val = v.get("value", "?")
+        req = v.get("required", v.get("threshold", "?"))
+        if k in bottlenecks:
+            mark = "<span style='color:#C62828;'> ✗</span>"
+        else:
+            mark = "<span style='color:#2E7D32;'> ✓</span>"
+        rows += f"<tr><td style='padding:1px 4px;font-size:11px;'>{label}</td><td style='padding:1px 4px;font-size:11px;'>{val}/{req}{mark}</td></tr>"
+    return f"<table style='border-collapse:collapse;'>{rows}</table>"
+
+
+def _hover_text_comparison(s: dict, display_name: str, milestone: str = "",
+                           exit_analysis: dict | None = None,
+                           agent_color: str = "#999",
+                           survived_days: int = 0) -> str:
+    """비교 차트용 호버 텍스트 — 스탯테이블 | 행동/연봉/이벤트 | 퇴사스탯(해당 시)."""
+    events_str = ", ".join(s.get("events", [])) or "없음"
+    summary = _one_line_summary(s)
+    score = _composite_score(s)
+    job_changes = s.get("job_changes", 0)
+    job_str = f" / 이직 {job_changes}회" if job_changes > 0 else ""
+    day = s["day"]
+    day_label = _day_to_label(day)
+    milestone_tag = f" <b style='color:#C62828;'>{milestone}</b>" if milestone else ""
+
+    # 스탯 3열 테이블 데이터
+    stats = [
+        ("성과", s.get("performance", 0)),
+        ("상사", s.get("boss_favor", 0)),
+        ("능력", s.get("skill", 0)),
+        ("동료", s.get("peer_relation", 0)),
+        ("평판", s.get("reputation", 0)),
+        ("정치", s.get("political_skill", 0)),
+        ("스트레스", s.get("stress", 0)),
+        ("체력", s.get("energy", 0)),
+    ]
+    stat_rows = ""
+    for row_start in range(0, len(stats), 3):
+        cells = ""
+        for label, val in stats[row_start:row_start + 3]:
+            cells += f"<td style='padding:2px 6px;border:1px solid #e0e0e0;font-size:12px;'><b>{label}</b> {val:.0f}</td>"
+        remaining = 3 - len(stats[row_start:row_start + 3])
+        cells += "<td style='border:1px solid #e0e0e0;'></td>" * remaining
+        stat_rows += f"<tr>{cells}</tr>"
+    stat_rows += f"<tr><td colspan='3' style='padding:3px 6px;border:1px solid #e0e0e0;text-align:center;font-size:12px;background:#f0f0f0;'><b>총점: {score:.0f}</b></td></tr>"
+
+    # 퇴사 스탯 (3번째 열, 해당 시에만)
+    exit_col = ""
+    if exit_analysis:
+        exit_html = _exit_stat_html(exit_analysis)
+        if exit_html:
+            exit_col = f"<div style='border-left:1px solid #e0e0e0;padding-left:10px;'>{exit_html}</div>"
+
+    return (
+        f"<div style='margin-bottom:8px;' data-color='{agent_color}' data-survived='{survived_days}'>"
+        f"<b>DAY {day}</b> ({day_label}){milestone_tag}<br>"
+        f"<b>{display_name}</b> ({s['position']}{job_str})"
+        f"</div>"
+        f"<div style='display:flex;gap:12px;'>"
+        f"<div><table style='border-collapse:collapse;'>{stat_rows}</table></div>"
+        f"<div style='font-size:12px;line-height:1.8;'>"
+        f"행동: <b>{s['action']}</b><br>"
+        f"연봉: <b>{s['salary']:,}원</b><br>"
         f"이벤트: {events_str}<br>"
-        f"─────────────────<br>"
-        f"<i>{summary}</i>"
+        f"<i style='color:#555;'>\" {summary} \"</i>"
+        f"</div>"
+        f"{exit_col}"
+        f"</div>"
     )
 
 
@@ -310,16 +533,69 @@ def draw_interactive_html(log_path: Path, show: bool = False) -> Path:
             annotation_font_color="#546E7A",
         )
 
+    # ── 성찰 마커 (row=1 스탯 차트에 표시) ────────────────────────────
+    reflections = result.get("_reflections", [])
+    if reflections:
+        day_to_score = {}
+        for s in steps:
+            # row1에는 개별 스탯이 표시되므로, performance를 y값으로 사용
+            day_to_score[s["day"]] = s.get("performance", 0)
+        ref_days, ref_ys, ref_texts = [], [], []
+        for ref in reflections:
+            ref_day = ref.get("day", 0)
+            if ref_day in day_to_score:
+                ref_days.append(ref_day)
+                ref_ys.append(day_to_score[ref_day])
+                ref_body = ref.get("text", "").replace("\n", "<br>")
+                ref_texts.append(
+                    f"<b>🔍 자기성찰</b> Day {ref_day}<br>"
+                    f"─────────<br>"
+                    f"{ref_body}"
+                )
+        if ref_days:
+            fig.add_trace(go.Scatter(
+                x=ref_days, y=ref_ys,
+                mode="markers",
+                marker=dict(color="#FF6F00", size=10, symbol="triangle-up",
+                            line=dict(color="white", width=1)),
+                name="자기성찰",
+                hovertemplate="%{text}<extra></extra>",
+                text=ref_texts,
+            ), row=1, col=1)
+
     # ── 레이아웃 ─────────────────────────────────────────────────────
     agent_name   = result.get("agent", log_path.stem)
     survived     = result.get("survived_days", "?")
     final_pos    = result.get("final_position", "?")
     final_sal    = result.get("final_salary", 0)
-    end_status   = "해고" if result.get("is_fired") else "자진퇴사" if result.get("is_resigned") else "정상 종료"
+    if result.get("is_fired"):
+        end_status = "해고"
+    elif result.get("is_resigned"):
+        resign_reason = (result.get("exit_analysis") or {}).get("reason", "")
+        end_status = "희망퇴직" if resign_reason == "희망퇴직" else "자진퇴사"
+    elif result.get("is_retired"):
+        end_status = "정년퇴직"
+    else:
+        end_status = "정상 종료"
+    # 원인 요약 (타이틀에 간략히 표시)
+    reason_brief = ""
+    exit_analysis = result.get("exit_analysis", {})
+    if exit_analysis.get("reason"):
+        r = exit_analysis["reason"]
+        if r == "승진_미달":
+            bottlenecks = exit_analysis.get("bottlenecks", [])
+            bn_text = ", ".join(_STAT_LABELS.get(b, b) for b in bottlenecks)
+            reason_brief = f" (원인: 승진 미달 — {bn_text} 부족)" if bn_text else " (원인: 승진 미달)"
+        elif r == "성과_부진":
+            reason_brief = " (원인: 성과 부진)"
+        elif r == "번아웃":
+            reason_brief = f" (원인: 번아웃 {exit_analysis.get('duration', '?')}일)"
+        elif r == "만성_스트레스":
+            reason_brief = f" (원인: 만성 스트레스 {exit_analysis.get('duration', '?')}일)"
 
     fig.update_layout(
         title=dict(
-            text=f"[{agent_name}]  {survived}일 생존  |  최종: {final_pos}  |  {final_sal:,}원  |  {end_status}",
+            text=f"[{agent_name}]  {survived}일 생존  |  최종: {final_pos}  |  {final_sal:,}원  |  {end_status}{reason_brief}",
             font=dict(size=14),
         ),
         hovermode="x unified",
@@ -386,6 +662,9 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         print("[경고] 유효한 데이터셋이 없습니다.")
         return Path(log_paths[0])
 
+    # 생존일수 내림차순 정렬 (범례·카드 순서 일치)
+    datasets.sort(key=lambda d: d["result"].get("survived_days", len(d["steps"])), reverse=True)
+
     n = len(datasets)
 
     # 레이아웃: row1=라인 차트(전체 폭), row2=평일 파이 n개, row3=주말 파이 n개
@@ -405,7 +684,7 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
     fig = make_subplots(
         rows=3, cols=n,
         specs=specs,
-        subplot_titles=[line_title] + weekday_titles + weekend_titles,
+        subplot_titles=[""] + weekday_titles + weekend_titles,
         row_heights=[0.42, 0.28, 0.26],
         vertical_spacing=0.15,
     )
@@ -423,7 +702,21 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         days   = [s["day"] for s in steps]
         scores = [_composite_score(s) for s in steps]
         ma     = _moving_average(scores, window=30)
-        hovers = [_hover_text(s, personality=d["display"]) for s in steps]
+        milestones = _build_milestones(steps, result=d["result"])
+        # 마지막 스텝에만 exit_analysis 전달
+        r_data = d["result"]
+        ea = r_data.get("exit_analysis") or {}
+        if not ea:
+            log = r_data.get("_exit_log", {})
+            ea = log.get("analysis", {})
+        agent_survived = d["result"].get("survived_days", len(steps))
+        hovers = []
+        for idx, (s, m) in enumerate(zip(steps, milestones)):
+            ex = ea if (ea and idx == len(steps) - 1) else None
+            hovers.append(_hover_text_comparison(s, display_name=d["display"],
+                                                  milestone=m, exit_analysis=ex,
+                                                  agent_color=color,
+                                                  survived_days=agent_survived))
         r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
         # 원시 점수 (흐릿)
@@ -439,10 +732,16 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
 
         # 범례에 최종 결과 표시
         r_data = d["result"]
+        exit_reason = (r_data.get("exit_analysis") or {}).get("reason", "")
         if r_data.get("is_fired"):
             legend_suffix = " (해고)"
+        elif exit_reason == "희망퇴직":
+            legend_suffix = " (희망퇴직)"
         elif r_data.get("is_resigned"):
             legend_suffix = " (퇴사)"
+        elif r_data.get("is_retired"):
+            final_pos = r_data.get("final_position", "")
+            legend_suffix = f" (정년퇴직/{final_pos})"
         else:
             final_pos = r_data.get("final_position", "")
             legend_suffix = f" ({final_pos})" if final_pos else ""
@@ -459,6 +758,11 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             fillcolor=f"rgba({r},{g},{b},0.07)",
             hovertext=hovers,
             hovertemplate="%{hovertext}<extra></extra>",
+            hoverlabel=dict(
+                bgcolor=f"rgba({r},{g},{b},0.08)",
+                bordercolor=color,
+                font=dict(size=12, color="#222", family="monospace"),
+            ),
         ), row=1, col=1)
 
         # 승진 마커 (그래프 위 ★ 점으로 표시, 호버로 상세 확인)
@@ -481,8 +785,7 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
                 marker=dict(color=color, size=12, symbol="star", line=dict(color="white", width=1)),
                 legendgroup=d["display"],
                 showlegend=False,
-                hovertemplate="%{text}<extra></extra>",
-                text=promo_texts,
+                hoverinfo="skip",
             ), row=1, col=1)
 
         # 이직 마커 (그래프 위 🔄 점으로 표시)
@@ -506,8 +809,7 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
                 marker=dict(color=color, size=10, symbol="diamond", line=dict(color="white", width=1)),
                 legendgroup=d["display"],
                 showlegend=False,
-                hovertemplate="%{text}<extra></extra>",
-                text=jc_texts,
+                hoverinfo="skip",
             ), row=1, col=1)
 
         # 종료 마커 (해고/퇴사 시 그래프 끝에 X 표시)
@@ -522,10 +824,13 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             else:
                 end_label = "자진퇴사"
                 end_symbol = "cross"
+            reason_text = _exit_reason_text(r_data)
+            reason_line = f"<br>─────────<br>{reason_text}" if reason_text else ""
             end_text = (
                 f"<b>{end_label}</b><br>{d['display']}<br>"
                 f"Day {last_day} ({last_day // 365}년 {(last_day % 365) // 30}개월)<br>"
                 f"최종: {last_step['position']}  |  연봉: {last_step['salary']:,}원"
+                f"{reason_line}"
             )
             fig.add_trace(go.Scatter(
                 x=[last_day], y=[last_score],
@@ -534,9 +839,75 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
                             line=dict(color="white", width=2)),
                 legendgroup=d["display"],
                 showlegend=False,
-                hovertemplate="%{text}<extra></extra>",
-                text=[end_text],
+                hoverinfo="skip",
             ), row=1, col=1)
+
+        # 성찰 마커 + annotation (triangle-up, 호버로 성찰 내용 + 그래프에 핵심 키워드)
+        reflections = d["result"].get("_reflections", [])
+        if reflections:
+            day_to_score = {s["day"]: _composite_score(s) for s in steps}
+            ref_days, ref_scores, ref_texts = [], [], []
+            ref_annotations = []  # (day, score, short_text)
+            for ref in reflections:
+                ref_day = ref.get("day", 0)
+                if ref_day not in day_to_score:
+                    continue
+                score = day_to_score[ref_day]
+                ref_days.append(ref_day)
+                ref_scores.append(score)
+                ref_body = ref.get("text", "").replace("\n", "<br>")
+                ref_texts.append(
+                    f"<b>🔍 자기성찰</b> Day {ref_day} ({_day_to_label(ref_day)})<br>"
+                    f"─────────<br>"
+                    f"{ref_body}"
+                )
+                # 문제점 줄에서 핵심 키워드 추출 → annotation용
+                short = _extract_reflection_label(ref.get("text", ""))
+                if short:
+                    ref_annotations.append((ref_day, score, short))
+
+            if ref_days:
+                r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+                fig.add_trace(go.Scatter(
+                    x=ref_days, y=ref_scores,
+                    mode="markers",
+                    marker=dict(color=f"rgba({r},{g},{b},0.7)", size=10,
+                                symbol="triangle-up",
+                                line=dict(color="white", width=1)),
+                    legendgroup=d["display"],
+                    showlegend=False,
+                    hovertemplate="%{text}<extra></extra>",
+                    text=ref_texts,
+                    hoverlabel=dict(
+                        bgcolor="rgba(255,255,255,0.95)",
+                        bordercolor=color,
+                        font=dict(size=11, color="#222", family="monospace"),
+                    ),
+                ), row=1, col=1)
+
+            # 핵심 성찰 annotation (최대 4개, 균등 간격으로 선택)
+            max_annotations = 4
+            if ref_annotations:
+                step_size = max(1, len(ref_annotations) // max_annotations)
+                selected = [ref_annotations[j] for j in range(0, len(ref_annotations), step_size)][:max_annotations]
+                for idx, (aday, ascore, alabel) in enumerate(selected):
+                    # 위/아래 교대 배치로 겹침 방지
+                    ay_offset = -35 if idx % 2 == 0 else 35
+                    fig.add_annotation(
+                        x=aday, y=ascore,
+                        text=alabel,
+                        showarrow=True,
+                        arrowhead=0,
+                        arrowwidth=1,
+                        arrowcolor=color,
+                        ax=0, ay=ay_offset,
+                        font=dict(size=9, color=color),
+                        bgcolor="rgba(255,255,255,0.85)",
+                        bordercolor=color,
+                        borderwidth=1,
+                        borderpad=2,
+                        xref="x", yref="y",
+                    )
 
     fig.update_xaxes(tickvals=tickvals, ticktext=ticktext,
                      title_text="기간", row=1, col=1)
@@ -611,15 +982,34 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             showlegend=True,
         ), row=1, col=1)
 
+    # ── 마커 범례 (승진/이직/해고 아이콘 설명) ─────────────────────
+    for symbol, label, color in [
+        ("star", "승진", "#7B1FA2"),
+        ("diamond", "이직", "#546E7A"),
+        ("x", "해고/퇴사", "#E53935"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(color=color, size=10, symbol=symbol),
+            name=label,
+            showlegend=True,
+        ), row=1, col=1)
+
     fig.update_layout(
         title=dict(
             text=line_title,
-            font=dict(size=14),
+            font=dict(size=15),
+            x=0.01, xanchor="left",
         ),
-        hovermode="x unified",
+        hovermode="x",
+        hoverlabel=dict(font=dict(size=1, family="monospace"), bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)"),
         height=1150,
-        # 에이전트명 범례 (선 그래프 상단)
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        # 에이전트명 + 마커 범례 (선 그래프 우측 상단, 세로 배치)
+        legend=dict(
+            orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.01,
+            font=dict(size=12),
+        ),
         # 평일 행동 범례 (회사 행동 파이차트 바로 아래, row2-row3 사이 간격)
         legend2=dict(
             orientation="h", yanchor="top", y=0.345, xanchor="center", x=0.5,
@@ -631,15 +1021,94 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             font=dict(size=11), title=dict(text="주말 행동  ", side="left"),
         ),
         template="plotly_white",
-        margin=dict(t=100, b=150, l=60, r=40),
+        margin=dict(t=80, b=150, l=60, r=180),
     )
 
     names_tag = "_".join(d["display"] for d in datasets)
     out_path  = Path(log_paths[0]).parent / f"{_dt.now().strftime('%y%m%d_%H%M%S')}_comparison_{names_tag}.html"
-    fig.write_html(str(out_path))
+
+    # 커스텀 HTML: 차트 70% + 호버 정보 패널 30% 고정 레이아웃
+    chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="chart")
+    custom_html = f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>{line_title}</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ display: flex; height: 100vh; font-family: 'Malgun Gothic', monospace; background: #fafafa; }}
+  #chart-container {{ width: 70%; height: 100%; overflow-y: auto; }}
+  #info-panel {{
+    width: 30%; height: 100%; overflow-y: auto;
+    border-left: 2px solid #ddd; background: #fff;
+    padding: 16px; font-size: 13px; line-height: 1.6;
+  }}
+  .hoverlayer .hovertext {{ display: none !important; }}
+  #info-panel h3 {{
+    font-size: 15px; margin-bottom: 12px; padding-bottom: 8px;
+    border-bottom: 2px solid #1565C0; color: #1565C0;
+  }}
+  #info-content {{ }}
+  .info-card {{
+    background: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 6px;
+    padding: 12px; margin-bottom: 10px;
+  }}
+  .info-card table {{ border-collapse: collapse; }}
+  .info-card td {{ white-space: nowrap; }}
+  .info-card.reflect {{
+    background: #fff8e1; border-color: #ffb300;
+  }}
+  .info-placeholder {{
+    color: #999; font-style: italic; margin-top: 40px; text-align: center;
+  }}
+</style>
+</head><body>
+<div id="chart-container">{chart_html}</div>
+<div id="info-panel">
+  <h3>상세 정보</h3>
+  <div id="info-content">
+    <p class="info-placeholder">그래프 위에 마우스를 올리면<br>상세 정보가 여기에 표시됩니다</p>
+  </div>
+</div>
+<script>
+  var chartDiv = document.getElementById('chart');
+  var infoContent = document.getElementById('info-content');
+
+  chartDiv.on('plotly_hover', function(data) {{
+    var cards = [];
+    data.points.forEach(function(pt) {{
+      var txt = pt.hovertext || pt.text || '';
+      if (!txt || txt === 'undefined') return;
+      // 성찰 마커인지 확인
+      var isReflect = txt.includes('자기성찰');
+      var cls = isReflect ? 'info-card reflect' : 'info-card';
+      // data-color 추출하여 테두리 색상 적용
+      var colorMatch = txt.match(/data-color='([^']+)'/);
+      var borderStyle = colorMatch ? 'border-left:4px solid ' + colorMatch[1] + ';' : '';
+      cards.push('<div class="' + cls + '" style="' + borderStyle + '">' + txt + '</div>');
+    }});
+    if (cards.length > 0) {{
+      // data-survived 기준 내림차순 정렬 (오래 생존한 성향이 위)
+      cards.sort(function(a, b) {{
+        var sa = (a.match(/data-survived='(\d+)'/) || [0,0])[1];
+        var sb = (b.match(/data-survived='(\d+)'/) || [0,0])[1];
+        return Number(sb) - Number(sa);
+      }});
+      infoContent.innerHTML = cards.join('');
+    }}
+  }});
+
+  chartDiv.on('plotly_unhover', function() {{
+    // 호버 해제 시 마지막 내용 유지 (지우지 않음)
+  }});
+</script>
+</body></html>"""
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(custom_html)
     print(f"비교 차트 저장됨: {out_path}")
     if show:
-        fig.show()
+        import webbrowser
+        webbrowser.open(str(out_path))
     return out_path
 
 

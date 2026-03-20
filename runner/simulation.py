@@ -29,7 +29,8 @@ def run_simulation(
     step_logs = []
     pending_actions: list[str] = []
     recent_events: list[tuple[int, str]] = []  # (day, 이벤트명) 누적
-    current_comment: str = ""  # LLM이 생성한 한줄 코멘트
+    reflection_interval = 90  # 성찰 주기 (일) — 분기마다
+    last_reflection_day = 0   # 마지막 성찰 시점
 
     # 시뮬 시작 시 즉시 파일 생성 (중간에 중단해도 기록 보존)
     Path(log_dir).mkdir(exist_ok=True)
@@ -65,11 +66,30 @@ def run_simulation(
         else:
             # 배치 모드: 평일 계획이 소진되면 새로 요청
             if not pending_actions:
+                # Reflection: 분기(90일)마다 자기성찰 (llm_reflect가 있을 때만)
+                if (hasattr(agent, 'reflect') and agent.llm_reflect
+                        and day - last_reflection_day >= reflection_interval
+                        and len(agent.history) >= reflection_interval):
+                    reflection_text = agent.reflect(
+                        state, window=reflection_interval,
+                        promotion_requirements=env.promotion_requirements,
+                    )
+                    last_reflection_day = day
+                    if reflection_text:
+                        txt_file.write(f"  [성찰] Day {day}\n")
+                        for line in reflection_text.splitlines():
+                            txt_file.write(f"    {line}\n")
+                        txt_file.flush()
+                        log_file.write(json.dumps({
+                            "type": "reflection", "day": day,
+                            "text": reflection_text,
+                        }, ensure_ascii=False) + "\n")
+                        log_file.flush()
+
                 observation = state.to_observation()
                 remaining = min(decision_interval, max_days - day + 1)
                 if decision_interval > 1:
                     pending_actions = agent.decide_batch(state, observation, remaining)
-                    current_comment = getattr(agent, '_last_comment', '') or ""
                 else:
                     pending_actions = [agent.decide(state, observation)]
 
@@ -97,7 +117,6 @@ def run_simulation(
             "energy": round(state.energy, 1),
             "events": state.events_today,
             "job_changes": state.job_changes,
-            "comment": current_comment,
         }
         step_logs.append(step)
         log_file.write(json.dumps(step, ensure_ascii=False) + "\n")
@@ -203,9 +222,13 @@ def _format_exit_analysis(env) -> str:
         info = env.analyze_resignation()
         if info["reason"] == "번아웃":
             lines.append(f"  원인: 번아웃 (극한 상태 {info['duration']}일 연속)")
-        else:
+            lines.append(f"    스트레스: {info['stress']}  체력: {info['energy']}")
+        elif info["reason"] == "만성_스트레스":
             lines.append(f"  원인: 만성 스트레스 (고스트레스 누적 {info['duration']}일)")
-        lines.append(f"    스트레스: {info['stress']}  체력: {info['energy']}")
+            lines.append(f"    스트레스: {info['stress']}  체력: {info['energy']}")
+        elif info["reason"] == "희망퇴직":
+            lines.append(f"  원인: 희망퇴직 (경력 {info['career_years']}년차 {info['position']})")
+            lines.append(f"    스트레스: {info['stress']}  체력: {info['energy']}")
 
     # 공통: 최종 스탯 요약
     lines.append(f"  최종 상태: {state.position} / 연봉 {state.salary:,}원")
@@ -341,6 +364,8 @@ def _status_summary(state, burnout_counter: int) -> str:
 def _build_result(agent_name: str, state, step_logs: list, max_days: int,
                    env=None) -> dict:
     survived_days = step_logs[-1]["day"] if step_logs else 0
+    # 정년퇴직: MAX_DAYS까지 생존한 경우
+    is_retired = (survived_days >= max_days and not state.is_fired and not state.is_resigned)
     result = {
         "agent": agent_name,
         "survived_days": survived_days,
@@ -349,6 +374,7 @@ def _build_result(agent_name: str, state, step_logs: list, max_days: int,
         "final_salary": state.salary,
         "is_fired": state.is_fired,
         "is_resigned": state.is_resigned,
+        "is_retired": is_retired,
         "promoted": state.position != "사원",
         "final_skill": round(state.skill, 1),
         "final_performance": round(state.performance, 1),
@@ -360,4 +386,12 @@ def _build_result(agent_name: str, state, step_logs: list, max_days: int,
         result["exit_analysis"] = (
             env.analyze_fire() if state.is_fired else env.analyze_resignation()
         )
+    elif is_retired:
+        years = survived_days // 365
+        result["exit_analysis"] = {
+            "reason": "정년퇴직",
+            "detail": f"경력 {years}년 — {state.position}으로 정년퇴직",
+            "position": state.position,
+            "career_years": years,
+        }
     return result
