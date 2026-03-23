@@ -395,7 +395,9 @@ def _exit_stat_html(analysis: dict) -> str:
 def _hover_text_comparison(s: dict, display_name: str, milestone: str = "",
                            exit_analysis: dict | None = None,
                            agent_color: str = "#999",
-                           survived_days: int = 0) -> str:
+                           survived_days: int = 0,
+                           pos_rank: int = 0,
+                           salary: int = 0) -> str:
     """비교 차트용 호버 텍스트 — 스탯테이블 | 행동/연봉/이벤트 | 퇴사스탯(해당 시)."""
     events_str = ", ".join(s.get("events", [])) or "없음"
     summary = _one_line_summary(s)
@@ -435,7 +437,7 @@ def _hover_text_comparison(s: dict, display_name: str, milestone: str = "",
             exit_col = f"<div style='border-left:1px solid #e0e0e0;padding-left:10px;'>{exit_html}</div>"
 
     return (
-        f"<div style='margin-bottom:8px;' data-color='{agent_color}' data-survived='{survived_days}'>"
+        f"<div style='margin-bottom:8px;' data-color='{agent_color}' data-survived='{survived_days}' data-posrank='{pos_rank}' data-salary='{salary}'>"
         f"<b>DAY {day}</b> ({day_label}){milestone_tag}<br>"
         f"<b>{display_name}</b> ({s['position']}{job_str})"
         f"</div>"
@@ -618,7 +620,10 @@ def draw_interactive_html(log_path: Path, show: bool = False) -> Path:
     final_pos    = result.get("final_position", "?")
     final_sal    = result.get("final_salary", 0)
     if result.get("is_fired"):
-        end_status = "해고"
+        ea = result.get("exit_analysis") or {}
+        fire_detail = ea.get("detail", "")
+        fire_reason = ea.get("reason", "")
+        end_status = "권고사직" if ("권고사직" in fire_detail or fire_reason == "승진_미달") else "해고"
     elif result.get("is_resigned"):
         resign_reason = (result.get("exit_analysis") or {}).get("reason", "")
         end_status = "희망퇴직" if resign_reason == "희망퇴직" else "자진퇴사"
@@ -711,8 +716,13 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         print("[경고] 유효한 데이터셋이 없습니다.")
         return Path(log_paths[0])
 
-    # 생존일수 내림차순 정렬 (범례·카드 순서 일치)
-    datasets.sort(key=lambda d: d["result"].get("survived_days", len(d["steps"])), reverse=True)
+    # 생존일수 → 직급 → 연봉 내림차순 정렬 (범례·카드 순서 일치)
+    _POS_RANK = {"사원": 0, "대리": 1, "과장": 2, "차장": 3, "부장": 4, "이사": 5, "임원": 6}
+    datasets.sort(key=lambda d: (
+        d["result"].get("survived_days", len(d["steps"])),
+        _POS_RANK.get(d["result"].get("final_position", ""), 0),
+        d["result"].get("final_salary", 0),
+    ), reverse=True)
 
     n = len(datasets)
 
@@ -759,13 +769,17 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             log = r_data.get("_exit_log", {})
             ea = log.get("analysis", {})
         agent_survived = d["result"].get("survived_days", len(steps))
+        agent_pos_rank = _POS_RANK.get(d["result"].get("final_position", ""), 0)
+        agent_salary = d["result"].get("final_salary", 0)
         hovers = []
         for idx, (s, m) in enumerate(zip(steps, milestones)):
             ex = ea if (ea and idx == len(steps) - 1) else None
             hovers.append(_hover_text_comparison(s, display_name=d["display"],
                                                   milestone=m, exit_analysis=ex,
                                                   agent_color=color,
-                                                  survived_days=agent_survived))
+                                                  survived_days=agent_survived,
+                                                  pos_rank=agent_pos_rank,
+                                                  salary=agent_salary))
         r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
         # 원시 점수 (흐릿)
@@ -784,9 +798,15 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         final_pos = r_data.get("final_position", "")
         exit_reason = (r_data.get("exit_analysis") or {}).get("reason", "")
         if r_data.get("is_fired"):
-            reason_map = {"성과_부진": "성과부진", "승진_미달": "승진미달",
-                          "번아웃": "번아웃", "만성_스트레스": "만성스트레스"}
-            reason_text = reason_map.get(exit_reason, "해고")
+            ea = r_data.get("exit_analysis") or {}
+            fire_detail = ea.get("detail", "")
+            fire_reason = ea.get("reason", "")
+            if "권고사직" in fire_detail or fire_reason == "승진_미달":
+                reason_text = "권고사직"
+            else:
+                reason_map = {"성과_부진": "성과부진", "승진_미달": "승진미달",
+                              "번아웃": "번아웃", "만성_스트레스": "만성스트레스"}
+                reason_text = reason_map.get(exit_reason, "해고")
             legend_suffix = f" ({final_pos}/{reason_text})" if final_pos else f" ({reason_text})"
         elif exit_reason == "희망퇴직":
             legend_suffix = f" ({final_pos}/희망퇴직)" if final_pos else " (희망퇴직)"
@@ -872,7 +892,10 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             last_day = last_step["day"]
             last_score = _composite_score(last_step)
             if r_data.get("is_fired"):
-                end_label = "해고"
+                ea = r_data.get("exit_analysis") or {}
+                fire_detail = ea.get("detail", "")
+                fire_reason = ea.get("reason", "")
+                end_label = "권고사직" if ("권고사직" in fire_detail or fire_reason == "승진_미달") else "해고"
                 end_symbol = "x"
             else:
                 end_label = "자진퇴사"
@@ -1097,9 +1120,27 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         if reason == "현직유지" or (not reason and final_pos == "임원"):
             end_milestone = "👔 현직 유지 (임원)"
         elif reason in ("성과_부진", "승진_미달", "번아웃", "만성_스트레스"):
-            reason_kr = {"성과_부진": "성과 부진", "승진_미달": "승진 미달",
-                         "번아웃": "번아웃", "만성_스트레스": "만성 스트레스"}[reason]
-            end_milestone = f"✕ 퇴사 발생 : {reason_kr}"
+            detail = analysis.get("detail", "")
+            if "권고사직" in detail or reason == "승진_미달":
+                # 상세 사유: 승진심사탈락 vs 스탯부족
+                bottlenecks = analysis.get("bottlenecks", [])
+                if not bottlenecks:
+                    fail_cnt = analysis.get("promotion_fail_count")
+                    if fail_cnt is not None:
+                        sub_reason = f"승진심사 {fail_cnt}회 탈락"
+                    else:
+                        sub_reason = "승진심사 탈락"
+                else:
+                    stat_kr = {"skill": "업무능력", "performance": "성과", "boss_favor": "상사신뢰", "reputation": "평판"}
+                    lacking = ", ".join(stat_kr.get(b, b) for b in bottlenecks)
+                    sub_reason = f"{lacking} 부족"
+                target = analysis.get("target_position", "")
+                pos_info = f" [{final_pos}→{target}]" if target else ""
+                end_milestone = f"✕ 권고사직 ({sub_reason}){pos_info}"
+            else:
+                reason_kr = {"성과_부진": "성과 부진", "승진_미달": "승진 미달",
+                             "번아웃": "번아웃", "만성_스트레스": "만성 스트레스"}[reason]
+                end_milestone = f"✕ 퇴사 발생 : {reason_kr}"
         elif reason == "희망퇴직":
             factor = analysis.get("voluntary_factor", "")
             end_milestone = f"✕ 퇴사 발생 : 희망퇴직({factor})" if factor else "✕ 퇴사 발생 : 희망퇴직"
@@ -1109,11 +1150,14 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             end_milestone = f"🎉 정년퇴직 ({final_pos})"
 
         survived = r_data.get("survived_days", last_step.get("day", 0))
+        end_pos_rank = _POS_RANK.get(r_data.get("final_position", ""), 0)
+        end_salary = r_data.get("final_salary", 0)
         ea = analysis if analysis else None
         end_hover = _hover_text_comparison(
             last_step, display_name=d["display"],
             milestone=end_milestone, exit_analysis=ea,
-            agent_color=color, survived_days=survived)
+            agent_color=color, survived_days=survived,
+            pos_rank=end_pos_rank, salary=end_salary)
         end_card_html = (f'<div class="info-card" style="border-left:4px solid {color};">'
                          f'{end_hover}</div>')
         end_cards_js[color] = end_card_html.replace("'", "\\'").replace("\n", "")
@@ -1204,9 +1248,15 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
     var allCards = Object.values(currentCards);
     if (allCards.length > 0) {{
       allCards.sort(function(a, b) {{
-        var sa = (a.match(/data-survived='(\d+)'/) || [0,0])[1];
-        var sb = (b.match(/data-survived='(\d+)'/) || [0,0])[1];
-        return Number(sb) - Number(sa);
+        var sa = Number((a.match(/data-survived='(\d+)'/) || [0,0])[1]);
+        var sb = Number((b.match(/data-survived='(\d+)'/) || [0,0])[1]);
+        if (sa !== sb) return sb - sa;
+        var pa = Number((a.match(/data-posrank='(\d+)'/) || [0,0])[1]);
+        var pb = Number((b.match(/data-posrank='(\d+)'/) || [0,0])[1]);
+        if (pa !== pb) return pb - pa;
+        var ya = Number((a.match(/data-salary='(\d+)'/) || [0,0])[1]);
+        var yb = Number((b.match(/data-salary='(\d+)'/) || [0,0])[1]);
+        return yb - ya;
       }});
       infoContent.innerHTML = allCards.join('');
     }}

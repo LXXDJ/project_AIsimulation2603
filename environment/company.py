@@ -109,6 +109,8 @@ class CompanyEnvironment:
         self._burnout_counter = 0      # 번아웃 조건 연속 일수 카운터
         self._chronic_stress_days = 0  # 만성 스트레스 누적 일수 (스트레스 70+ 시 +1, 아래면 -2)
         self._job_change_counter = 0   # 이직 준비 연속 일수 카운터
+        self._job_change_cooldown = 0  # 이직 후 쿨다운 (이 기간 동안 이직 카운터 누적 안됨)
+        self._promotion_fail_count = {}  # 직급별 승진 심사 탈락 횟수
         self._last_hoesik_day = -30    # 마지막 회식 발생일 (30일 쿨다운)
         # 승진 요건: min_days는 단순 잠금 기간 (6개월~1년), 실제 병목은 스탯
         # 설계: performance 평형점 ≈ skill + 5 (프로젝트집중 0.05/0.01), boss_favor는 적극 관리 필요
@@ -125,9 +127,9 @@ class CompanyEnvironment:
             "부장": {"skill": 56, "performance": 66, "boss_favor": 62, "reputation": 62,
                      "min_days": 3285},  # 9년
             "이사": {"skill": 60, "performance": 68, "boss_favor": 66, "reputation": 65,
-                     "min_days": 4745},  # 13년
+                     "min_days": 4745},  # 13년 (부장→이사 승진 요건)
             "임원": {"skill": 65, "performance": 72, "boss_favor": 72, "reputation": 70,
-                     "min_days": 5840},  # 16년
+                     "min_days": 5840},  # 16년 (이사→임원 승진 요건)
         }
 
     def reset(self) -> GameState:
@@ -136,6 +138,8 @@ class CompanyEnvironment:
         self._burnout_counter = 0
         self._chronic_stress_days = 0
         self._job_change_counter = 0
+        self._job_change_cooldown = 0
+        self._promotion_fail_count = {}
         self._last_hoesik_day = -30
         return copy.deepcopy(self.state)
 
@@ -228,9 +232,14 @@ class CompanyEnvironment:
         else:
             log_lines.append(f"행동: {action}")
 
-        # 이직 준비 카운터 업데이트 (누적식 — 다른 행동해도 느리게 감소)
+        # 이직 쿨다운 감소
+        if self._job_change_cooldown > 0:
+            self._job_change_cooldown -= 1
+
+        # 이직 준비 카운터 업데이트 (쿨다운 중에는 누적 안됨)
         if action == "이직 준비를 한다":
-            self._job_change_counter += 3
+            if self._job_change_cooldown <= 0:
+                self._job_change_counter += 3
         else:
             self._job_change_counter = max(0, self._job_change_counter - 1)
 
@@ -247,7 +256,7 @@ class CompanyEnvironment:
             for key, value in event.resets.items():
                 if hasattr(self.state, key):
                     setattr(self.state, key, float(value))
-            if event.name == "헤드헌터 연락":
+            if event.name == "헤드헌터 연락" and self._job_change_cooldown <= 0:
                 self._job_change_counter += 15  # 헤드헌터 연락 시 이직 의향 강화
             self.state.events_today.append(event.name)
             log_lines.append(f"이벤트: {event.description}")
@@ -304,12 +313,17 @@ class CompanyEnvironment:
             else:
                 if self._promotion_cooldown > 0:
                     self._promotion_cooldown -= 1
-                # 직급 정체 자동 이직 욕구: 같은 직급 2년 이상 + 승진 불가 상태면 이직 욕구 상승
-                days_at_pos = self.state.day - self.state.position_entry_day
-                if days_at_pos > 730 and self._promotion_cooldown > 0:
-                    self._job_change_counter = min(
-                        self._job_change_counter + 0.4, 35
-                    )
+
+        # 이벤트/스탯 기반 이직 욕구 변동 (쿨다운 중이 아닐 때만)
+        if self._job_change_cooldown <= 0:
+            # 스트레스 높고 상사신뢰 낮으면 이직 욕구 상승
+            if self.state.stress >= 70 and self.state.boss_favor < 30:
+                self._job_change_counter = min(self._job_change_counter + 0.5, 35)
+            # 부정적 이벤트 발생 시 이직 욕구 상승
+            negative_events = {"갑질 피해", "상사 질책", "업무 과부하", "프로젝트 실패"}
+            for evt in self.state.events_today:
+                if evt in negative_events:
+                    self._job_change_counter = min(self._job_change_counter + 1.0, 35)
 
 
         # 연초(1월 1일) 처리: 연봉협상 + 연차 리셋
@@ -391,7 +405,9 @@ class CompanyEnvironment:
         return tenure_leave + position_bonus
 
     def _check_job_change(self) -> bool:
-        """이직 준비를 30일 이상 지속하면 이직 발생."""
+        """이직 준비를 30일 이상 지속하면 이직 발생. 최대 8회 제한."""
+        if self.state.job_changes >= 8:
+            return False
         return self._job_change_counter >= 30
 
     def _do_job_change(self) -> str:
@@ -413,60 +429,65 @@ class CompanyEnvironment:
         old_pos    = self.state.position
         promoted   = False
 
+        # ── 잡호퍼 페널티: 5회 이상 이직 시 평판·신뢰 추가 하락 ──
+        hopper_penalty = max(0, self.state.job_changes - 4)  # 5회째부터 1, 2, 3...
+
         if market_value >= 72:
             # ── 프리미엄 이직: 실력자가 좋은 오퍼를 받는 경우 ──────────────
             raise_rate = 0.40 if market_value >= 85 else 0.30
             tier_label = "프리미엄 오퍼"
 
-            # 직급 점프 (boss_favor 요건 면제 — 내부 정치가 아닌 외부 시장 평가)
+            # 직급 상승: 승진 요건 4종(업무능력, 성과, 상사신뢰, 평판) 전부 충족해야 승진
             next_idx = POSITIONS.index(self.state.position) + 1
             if next_idx < len(POSITIONS):
                 next_pos = POSITIONS[next_idx]
-                req = self.promotion_requirements.get(next_pos)
+                req = self.promotion_requirements.get(old_pos)
                 if req and (
                     self.state.skill       >= req["skill"] and
                     self.state.performance >= req["performance"] and
+                    self.state.boss_favor  >= req["boss_favor"] and
                     self.state.reputation  >= req["reputation"]
                 ):
                     self.state.position = next_pos
                     self.state.position_entry_day = self.state.day
                     promoted = True
 
-            # 좋은 회사 → 기대감 높고, 환경도 우호적
             self.state.boss_favor    = 65.0
             self.state.peer_relation = 45.0
-            self.state.reputation    = max(0.0, self.state.reputation   - 3.0)
+            self.state.reputation    = max(0.0, self.state.reputation   - 3.0 - hopper_penalty * 3)
             self.state.political_skill = max(0.0, self.state.political_skill - 2.0)
             self.state.stress  = max(0.0,   self.state.stress  - 30.0)
             self.state.energy  = min(100.0, self.state.energy  + 20.0)
 
         elif market_value >= 48:
-            # ── 일반 이직: 평범한 조건, 현실적인 적응 부담 ──────────────────
+            # ── 일반 이직: 연봉 소폭↑, 직급 유지 ──────────────────
             raise_rate = 0.15
             tier_label = "일반 조건"
 
-            # 표준 적응: 관계·성과 일부 리셋
             self.state.boss_favor    = 45.0
             self.state.peer_relation = 30.0
-            self.state.reputation    = max(0.0, self.state.reputation   - 8.0)
+            self.state.reputation    = max(0.0, self.state.reputation   - 8.0 - hopper_penalty * 3)
             self.state.political_skill = max(0.0, self.state.political_skill - 4.0)
             self.state.performance   = max(0.0, self.state.performance  - 8.0)
             self.state.stress  = max(0.0,   self.state.stress  - 15.0)
             self.state.energy  = min(100.0, self.state.energy  + 5.0)
 
         else:
-            # ── 도피성 이직: 실력·평판 부족 → 고만고만한 곳에서 악조건으로 시작 ──
+            # ── 도피성 이직: 악조건 시작 ──
             raise_rate = 0.05
             tier_label = "도피성 이직"
 
-            # 새 환경이 오히려 더 힘듦 — 성과·관계 크게 하락, 스트레스 증가
             self.state.boss_favor    = 30.0
             self.state.peer_relation = 20.0
-            self.state.reputation    = max(0.0, self.state.reputation   - 15.0)
+            self.state.reputation    = max(0.0, self.state.reputation   - 15.0 - hopper_penalty * 3)
             self.state.political_skill = max(0.0, self.state.political_skill - 5.0)
             self.state.performance   = max(0.0, self.state.performance  - 15.0)
             self.state.stress  = min(100.0, self.state.stress  + 15.0)
             self.state.energy  = max(0.0,   self.state.energy  - 10.0)
+
+        # 잡호퍼 연봉 인상률 감소 (5회 이상부터 인상률 깎임)
+        if hopper_penalty > 0:
+            raise_rate = max(0.02, raise_rate - hopper_penalty * 0.05)
 
         self.state.salary = int(self.state.salary * (1 + raise_rate))
 
@@ -478,9 +499,10 @@ class CompanyEnvironment:
         if not promoted:
             self.state.position_entry_day = self.state.day
 
-        # 카운터/쿨다운 리셋
+        # 카운터/쿨다운 리셋 + 이직 후 쿨다운 (2년간 이직 카운터 누적 안됨)
         self._job_change_counter  = 0
         self._promotion_cooldown  = 0
+        self._job_change_cooldown = 730  # 이직 후 2년 쿨다운
 
         raise_pct = int(raise_rate * 100)
         mv_str = f"시장가치 {market_value:.0f}"
@@ -488,6 +510,8 @@ class CompanyEnvironment:
             f"결과: [{tier_label}] 이직! ({mv_str}) "
             f"연봉 {raise_pct}% 인상 ({old_salary:,} → {self.state.salary:,}원)"
         )
+        if hopper_penalty > 0:
+            result += f" [잡호퍼 페널티 {hopper_penalty}단계]"
         if promoted:
             result += f" + {old_pos} → {self.state.position} 직급 상승!"
         else:
@@ -541,17 +565,21 @@ class CompanyEnvironment:
     CAREER_POSITION_FLOOR = [
         (5 * 365,  1),   # 경력 5년 → 최소 대리
         (8 * 365,  2),   # 경력 8년 → 최소 과장
-        (15 * 365, 4),   # 경력 15년 → 최소 부장 (명예퇴직 압박)
+        (15 * 365, 3),   # 경력 15년 → 최소 차장
+        (18 * 365, 4),   # 경력 18년 → 최소 부장 (차장이면 권고사직)
     ]
 
     def _check_voluntary_retirement(self) -> bool:
-        """경력 12년+ 시 성향·스탯에 따라 희망퇴직을 선택할 수 있다.
-        워라밸형은 확률↑, 성과형/정치형은 확률↓.
-        연 1회(1월) 판정, 직급이 낮을수록·스트레스 높을수록 확률 상승.
+        """경력 12년+ 시 직급·성향·스탯에 따라 희망퇴직을 선택할 수 있다.
+        차장이 1순위, 부장도 가능, 이사는 낮음, 임원은 거의 없음.
+        과장 이하는 희망퇴직 대상 아님 (해고로 처리).
         """
         if self.state.is_fired or self.state.is_resigned:
             return False
         if self.state.day < 12 * 365:
+            return False
+        # 과장 이하는 희망퇴직 대상 아님
+        if self.state.position_level <= 2:  # 과장 이하
             return False
         # 연 1회 1월 1일에만 판정
         day_in_year = self.state.day % 365
@@ -570,21 +598,30 @@ class CompanyEnvironment:
         elif years >= 12:
             base_prob = 0.04
 
-        # 직급별 확률 보정 (낮을수록 ↑, 높을수록 ↓)
-        if self.state.position_level <= 2:  # 과장 이하
-            base_prob += 0.12
-        elif self.state.position_level <= 3:  # 차장
-            base_prob += 0.05
-        elif self.state.position_level == 5:  # 이사
-            base_prob *= 0.7
-        elif self.state.position_level >= 6:  # 임원
-            base_prob *= 0.4
+        # 직급별 확률 보정 (차장이 1순위)
+        if self.state.position_level == 3:  # 차장 — 부장 못 달면 희망퇴직 1순위
+            base_prob *= 2.5
+        elif self.state.position_level == 4:  # 부장 — 이사 못 달면 희망퇴직
+            base_prob *= 1.0  # 기본값 유지
+        elif self.state.position_level == 5:  # 이사 — 버티는 경향
+            base_prob *= 0.3
+        elif self.state.position_level >= 6:  # 임원 — 거의 없음
+            base_prob *= 0.05
 
-        # 스트레스/체력 보정
-        if self.state.stress >= 60:
+        # 스트레스/체력 보정 (A/B 차이가 유의미하게 나도록 강화)
+        if self.state.stress >= 80:
+            base_prob += 0.15
+        elif self.state.stress >= 60:
+            base_prob += 0.08
+        elif self.state.stress <= 20:
+            base_prob *= 0.5   # 스트레스 낮으면 퇴직 욕구 감소
+
+        if self.state.energy <= 20:
+            base_prob += 0.10
+        elif self.state.energy <= 40:
             base_prob += 0.05
-        if self.state.energy <= 40:
-            base_prob += 0.03
+        elif self.state.energy >= 80:
+            base_prob *= 0.7   # 체력 좋으면 퇴직 욕구 감소
 
         # 성향 보정
         if self.personality:
@@ -626,11 +663,10 @@ class CompanyEnvironment:
             candidates.append((2, f"체력 저하 ({s.energy:.0f})"))
 
         # 4. 승진 가망 없음 (다음 직급 요건과 갭)
-        from environment.company import PROMOTION_REQUIREMENTS, POSITIONS
         pos_idx = POSITIONS.index(s.position) if s.position in POSITIONS else -1
         if pos_idx >= 0 and pos_idx < len(POSITIONS) - 1:
             next_pos = POSITIONS[pos_idx + 1]
-            req = PROMOTION_REQUIREMENTS.get(next_pos, {})
+            req = self.promotion_requirements.get(s.position, {})
             gaps = []
             for stat_key in ("skill", "performance", "boss_favor", "reputation"):
                 req_val = req.get(stat_key, 0)
@@ -679,7 +715,14 @@ class CompanyEnvironment:
         if self._promotion_cooldown > 0:
             return False
         pos = self.state.position
+        if pos == "임원":  # 최고 직급 — 승진 불가
+            return False
         if pos not in self.promotion_requirements:
+            return False
+
+        # 같은 직급에서 승진 심사 3회 탈락 → 더 이상 승진 불가 (명예퇴직 루트)
+        fail_count = self._promotion_fail_count.get(pos, 0)
+        if fail_count >= 3:
             return False
 
         # 승진은 연 2회 인사 시즌에만 가능: 1월(1~30일), 7월(181~210일)
@@ -689,14 +732,34 @@ class CompanyEnvironment:
         if not (in_jan or in_jul):
             return False
 
+        # 승진 실패 시 요건 상승 (탈락할수록 더 높은 스탯 필요)
         req = self.promotion_requirements[pos]
-        return (
-            self.state.skill >= req["skill"]
-            and self.state.performance >= req["performance"]
-            and self.state.boss_favor >= req["boss_favor"]
-            and self.state.reputation >= req["reputation"]
+        extra = fail_count * 5  # 1회 탈락: +5, 2회 탈락: +10
+        if not (
+            self.state.skill >= req["skill"] + extra
+            and self.state.performance >= req["performance"] + extra
+            and self.state.boss_favor >= req["boss_favor"] + extra
+            and self.state.reputation >= req["reputation"] + extra
             and self.state.day >= req["min_days"]
-        )
+        ):
+            return False
+
+        # 직급별 승진 확률 (상위 직급일수록 자리가 적어 승진이 어려움)
+        promotion_chance = {
+            "사원": 0.90,   # 사원→대리: 90%
+            "대리": 0.70,   # 대리→과장: 70%
+            "과장": 0.50,   # 과장→차장: 50%
+            "차장": 0.40,   # 차장→부장: 40%
+            "부장": 0.02,   # 부장→이사: 2%
+            "이사": 0.01,   # 이사→임원: 1%
+        }
+        chance = promotion_chance.get(pos, 0.5)
+        if self.rng.random() < chance:
+            return True
+        else:
+            # 승진 심사 탈락 기록
+            self._promotion_fail_count[pos] = fail_count + 1
+            return False
 
     # ------------------------------------------------------------------
     # 원인 분석 API
@@ -726,6 +789,7 @@ class CompanyEnvironment:
         # 성과 부진 해고
         if s.performance < FIRE_THRESHOLD["performance"] and s.boss_favor < FIRE_THRESHOLD["boss_favor"]:
             analysis["reason"] = "성과_부진"
+            analysis["detail"] = f"성과 부진 해고 — 성과 {s.performance:.0f}, 상사신뢰 {s.boss_favor:.0f}"
             analysis["stats"] = {
                 "performance": {"value": round(s.performance, 1), "threshold": FIRE_THRESHOLD["performance"]},
                 "boss_favor": {"value": round(s.boss_favor, 1), "threshold": FIRE_THRESHOLD["boss_favor"]},
@@ -742,6 +806,7 @@ class CompanyEnvironment:
                 # 해당 직급으로 가려면 어떤 요건이 부족했는지
                 # 현재 직급에서 다음 직급으로의 요건 확인
                 req = self.promotion_requirements.get(s.position, {})
+                fail_count = self._promotion_fail_count.get(s.position, 0)
                 for stat_name in ["skill", "performance", "boss_favor", "reputation"]:
                     req_val = req.get(stat_name, 0)
                     cur_val = getattr(s, stat_name, 0)
@@ -750,6 +815,14 @@ class CompanyEnvironment:
                     if cur_val < req_val:
                         analysis["bottlenecks"].append(stat_name)
                 analysis["target_position"] = target_pos
+                analysis["promotion_fail_count"] = fail_count
+                # 스탯은 충족했지만 확률 탈락으로 잘린 경우 vs 스탯 부족
+                if not analysis["bottlenecks"]:
+                    analysis["detail"] = f"권고사직 — 경력 {total_career // 365}년차 {s.position}, {target_pos} 승진 심사 {fail_count}회 탈락"
+                else:
+                    stat_kr = {"skill": "업무능력", "performance": "성과", "boss_favor": "상사신뢰", "reputation": "평판"}
+                    lacking = ", ".join(stat_kr.get(b, b) for b in analysis["bottlenecks"])
+                    analysis["detail"] = f"권고사직 — 경력 {total_career // 365}년차 {s.position}, {target_pos} 미달 ({lacking} 부족)"
                 return analysis
 
         return analysis

@@ -160,7 +160,11 @@ def run_simulation(
             log_file.flush()
 
         if not state.is_alive:
-            status = "해고" if state.is_fired else "자진퇴사"
+            if state.is_fired:
+                fire_detail = env.analyze_fire().get("detail", "") if env else ""
+                status = "권고사직" if "권고사직" in fire_detail else "해고"
+            else:
+                status = "자진퇴사"
             analysis_text = _format_exit_analysis(env)
             txt_file.write(f"[{agent.name}] {day}일차에 {status}됨.\n{analysis_text}\n")
             txt_file.flush()
@@ -364,9 +368,10 @@ def _status_summary(state, burnout_counter: int) -> str:
 def _build_result(agent_name: str, state, step_logs: list, max_days: int,
                    env=None) -> dict:
     survived_days = step_logs[-1]["day"] if step_logs else 0
-    # 정년퇴직: MAX_DAYS까지 생존한 경우 (임원은 정년 없음 → 현직 유지)
+    # 정년퇴직: MAX_DAYS까지 생존한 경우
+    # 부장/이사 → 정년퇴직, 임원 → 현직유지, 차장 이하 → 명예퇴직(사실상 불가능하지만 안전장치)
     reached_end = (survived_days >= max_days and not state.is_fired and not state.is_resigned)
-    is_retired = reached_end and state.position != "임원"
+    is_retired = reached_end and state.position in ("부장", "이사")
     result = {
         "agent": agent_name,
         "survived_days": survived_days,
@@ -400,6 +405,16 @@ def _build_result(agent_name: str, state, step_logs: list, max_days: int,
         result["exit_analysis"] = {
             "reason": "현직유지",
             "detail": f"경력 {years}년 — 임원 현직 유지",
+            "position": state.position,
+            "career_years": years,
+        }
+    elif reached_end and state.position_level <= 3:  # 차장 이하로 20년 도달 (안전장치)
+        years = survived_days // 365
+        is_retired = True
+        result["is_retired"] = True
+        result["exit_analysis"] = {
+            "reason": "명예퇴직",
+            "detail": f"경력 {years}년 — {state.position}으로 명예퇴직",
             "position": state.position,
             "career_years": years,
         }

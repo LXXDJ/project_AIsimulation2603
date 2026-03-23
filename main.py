@@ -43,8 +43,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
     use_reflect = reflection_override if reflection_override is not None else USE_REFLECTION
     llm = LLMClient(model=MODEL_DECISION)
     llm_reflect = LLMClient(model=MODEL_REFLECTION) if use_reflect else None
-    agent = ReActAgent(llm=llm, personality=PERSONALITIES[personality_name],
-                       llm_reflect=llm_reflect)
+    agent = ReActAgent(llm=llm, personality=PERSONALITIES[personality_name], llm_reflect=llm_reflect)
     # A/B 비교 시 이름 구분
     if name_suffix:
         agent.name = f"{agent.name}_{name_suffix}"
@@ -84,12 +83,16 @@ def main():
 
     # 병렬 실행
     results_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor: # 스레드 5개 준비
+        # with 블록을 빠져나오는 순간 shutdown(wait=True)가 자동 호출
+        # 1. 아직 실행 중인 스레드가 있으면 전부 끝날 때까지 대기
+        # 2. 스레드 풀 자원 해제
+        # with를 안 쓰고 executor.shutdown()을 직접 안 불러주면, 스레드가 프로그램 종료 후에도 남아서 좀비처럼 돌 수 있습니다.
         future_to_key = {}
         for i, job in enumerate(jobs):
-            future = executor.submit(_run_one, *job["args"], tqdm_position=i, **job["kwargs"])
+            future = executor.submit(_run_one, *job["args"], tqdm_position=i, **job["kwargs"])   # submit()으로 작업 5개 제출 → 5개 동시 실행 시작
             future_to_key[future] = job["key"]
-        for future in as_completed(future_to_key):
+        for future in as_completed(future_to_key):  # as_completed()로 끝나는 순서대로 결과 수거
             key = future_to_key[future]
             try:
                 results_map[key] = future.result()
@@ -111,7 +114,11 @@ def main():
         r = agent_results.get(m["agent"], {})
         exit_reason = (r.get("exit_analysis") or {}).get("reason", "")
         if m["fired"]:
-            end_status = "해고"
+            detail = (r.get("exit_analysis") or {}).get("detail", "")
+            if "권고사직" in detail:
+                end_status = "권고사직"
+            else:
+                end_status = "해고"
         elif exit_reason == "희망퇴직":
             end_status = "희망퇴직"
         elif r.get("is_resigned"):
