@@ -137,452 +137,315 @@
 
 ## **전체 코드 흐름**
 
-1. main.py 설정 / ThreadPoolExecutor 병렬 실행
-2. _run_one(): ReActAgent + CompanyEnvironment 생성
-3. run_simulation(): Day 1~7300 루프
-4. 주말: env.step_weekend() (LLM 호출 없음)
-5. 평일: decide_batch() → _build_memory_section() → LLM 호출 → 30일 계획
-6. env.step(): 행동 효과 → 자연 변화 → 랜덤 이벤트 → 생존 판정
-7. _store_episode_if_important(): 중요 사건만 메모리 저장
+```
+main.py 설정 → ThreadPoolExecutor 병렬 실행
+  → _run_one(): ReActAgent + CompanyEnvironment 생성
+    → run_simulation(): Day 1~7300 루프
+      → 주말: env.step_weekend() (LLM 호출 없음)
+      → 평일: decide_batch() → _build_memory_section() → LLM 호출 → 30일 계획
+        → env.step(): 행동 효과 → 자연 변화 → 랜덤 이벤트 → 생존 판정
+        → _store_episode_if_important(): 중요 사건만 메모리 저장
+```
 
-### **시작점: main.py**
+---
+
+### **시작점: main.py — 설정**
+
+> 🟢 **`main.py`** → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
 
 상단에서 기본적인 설정 가능
 
 ```python
-# ── 실험 설정 ──────────────────────────────────────────
-EXPERIMENT_SEED    = 42     # 모든 에이전트가 동일한 이벤트 시퀀스를 경험 (랜덤 이벤트 순서를 고정하는 값) : 값 자체는 아무 숫자나 상관없고, 바꾸면 이벤트 순서가 달라짐
-MAX_DAYS           = 7300   # 시뮬레이션 최대 기간 (일) — 20년
-LOG_INTERVAL       = 30     # 콘솔 출력 주기 (일) — 분기마다
-DECISION_INTERVAL  = 30     # 배치 결정 주기 (일) — 한달치 한 번에 결정
+EXPERIMENT_SEED    = 42          # 랜덤 시드 — 모든 에이전트가 동일한 이벤트를 경험
+MAX_DAYS           = 7300        # 20년
+DECISION_INTERVAL  = 30          # 30일치 행동을 한 번에 결정
+REFLECTION_INTERVAL = 90         # 성찰 주기 — 분기마다
 
-# ── Reflection 설정 ────────────────────────────────────
-USE_REFLECTION     = False              # 자기성찰 기능 on/off
-REFLECTION_INTERVAL = 90                # 성찰 주기 (일) — 분기마다
-MODEL_DECISION     = "gpt-4.1-mini"     # 배치 결정 + 히스토리 압축용 (저렴/빠름)
-MODEL_REFLECTION   = "gpt-4.1"          # Reflection 전용 (고품질)
+MODEL_DECISION     = "gpt-4.1-mini"    # 배치 결정용 (저렴/빠름)
+MODEL_REFLECTION   = "gpt-4.1"         # Reflection용 (고품질)
 
-# ── 비교할 성향 목록 ────────────────────────────────────
-# 사용 가능한 성향: "균형형", "성과형", "사교형", "정치형", "워라밸형"
 ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워라밸형"]
-
-# ── A/B 비교 실험 설정 ────────────────────────────────────
-# 특정 성향의 Reflection on/off를 나란히 비교하려면 여기에 성향명 추가
-# 예: ["정치형"] → 정치형(Reflection) vs 정치형(NoReflect) 동시 실행
-AB_COMPARE = ["정치형"]
-# ────────────────────────────────────────────────────────
+AB_COMPARE = ["정치형"]   # 정치형 Reflection on/off 나란히 비교
 ```
 
+---
+
+### **main.py — 병렬 실행**
+
+> `main.py` → 🟢 **`ThreadPoolExecutor`** → `_run_one()` → `ReActAgent` → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+
+5개 성향을 스레드 풀로 동시 실행. `as_completed()`로 먼저 끝나는 순서대로 결과를 수거.
+
 ```python
-# 병렬 실행
-results_map: dict[str, dict] = {}
-with ThreadPoolExecutor(max_workers=len(jobs)) as executor: # 스레드 풀 생성. 스레드 5개 준비
-    # with 블록을 빠져나오는 순간 shutdown(wait=True)가 자동 호출
-    # 1. 아직 실행 중인 스레드가 있으면 전부 끝날 때까지 대기
-    # 2. 스레드 풀 완전 해제
-    # with를 안 쓰고 executor.shutdown()을 직접 안 불러주면, 스레드가 프로그램 종료 후에도 남아서 좀비처럼 될 수 있습니다.
+with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
     future_to_key = {}
     for i, job in enumerate(jobs):
-        future = executor.submit(_run_one, *job["args"], tqdm_position=i, **job["kwargs"])   # _run_one 함수를 비동기로 제출 → 5개 동시 실행 시작
+        future = executor.submit(_run_one, *job["args"],
+                                 tqdm_position=i, **job["kwargs"])
         future_to_key[future] = job["key"]
-    for future in as_completed(future_to_key):  # as_completed()로 끝나는 순서대로 결과 수거
-        key = future_to_key[future]             # 어떤 future가 어떤 성향인지 매핑
-        try:
-            results_map[key] = future.result()
-        except Exception as e:
-            print(f"[오류] {key} 실행 실패: {e}")
+    for future in as_completed(future_to_key):
+        key = future_to_key[future]
+        results_map[key] = future.result()
 ```
 
-### **_run_one() → 에이전트·환경 생성**
+- `with` 블록을 빠져나오면 `shutdown(wait=True)`가 자동 호출 → 전부 끝날 때까지 대기 후 스레드 풀 해제
+- `with`를 안 쓰면 스레드가 프로그램 종료 후에도 좀비처럼 남을 수 있음
+
+---
+
+### **_run_one() — 에이전트·환경 생성**
+
+> `main.py` → `ThreadPoolExecutor` → 🟢 **`_run_one()`** → `ReActAgent` → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+
+각 스레드에서 LLM 2개 + 에이전트 + 환경을 생성하고, `run_simulation()`을 호출.
 
 ```python
-def _run_one(personality_name: str, tqdm_position: int = 0,
-             reflection_override: bool | None = None, name_suffix: str = "") -> dict:
-    """단일 에이전트 시뮬레이션 실행 (스레드별 독립 실행)."""
-    use_reflect = reflection_override if reflection_override is not None else USE_REFLECTION
-    llm = LLMClient(model=MODEL_DECISION)                                     # 배치 결정용 LLM
-    llm_reflect = LLMClient(model=MODEL_REFLECTION) if use_reflect else None  # Reflection용 LLM (고급)
-    agent = ReActAgent(llm=llm, personality=PERSONALITIES[personality_name], llm_reflect=llm_reflect)  # 에이전트 생성
-    # A/B 비교 시 이름 구분
-    if name_suffix:
-        agent.name = f"{agent.name}_{name_suffix}"
-    env = CompanyEnvironment(seed=EXPERIMENT_SEED, personality=agent.personality, max_days=MAX_DAYS)   # 환경 생성
+def _run_one(personality_name, tqdm_position=0,
+             reflection_override=None, name_suffix=""):
+    llm = LLMClient(model=MODEL_DECISION)              # 배치 결정용 LLM
+    llm_reflect = LLMClient(model=MODEL_REFLECTION)     # Reflection용 LLM (고급)
+    agent = ReActAgent(llm=llm,
+                       personality=PERSONALITIES[personality_name],
+                       llm_reflect=llm_reflect)          # 에이전트 생성
+    env = CompanyEnvironment(seed=EXPERIMENT_SEED,
+                             personality=agent.personality,
+                             max_days=MAX_DAYS)           # 환경 생성 (동일 시드)
 
-    return run_simulation(
-        agent=agent, env=env,
-        max_days=MAX_DAYS, log_interval=LOG_INTERVAL,
-        decision_interval=DECISION_INTERVAL,
-        reflection_interval=REFLECTION_INTERVAL, verbose=True,
-        tqdm_position=tqdm_position,
-    )
+    return run_simulation(agent=agent, env=env, ...)
 ```
 
-### **ReActAgent → 상속 구조**
+---
 
-base_agent.py → 부모 클래스
+### **ReActAgent — 상속 구조**
+
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → 🟢 **`ReActAgent`** → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+
+**BaseAgent (부모)**  — 에이전트의 공통 뼈대
 
 ```python
 class BaseAgent(ABC):
-    """모든 에이전트의 공통 인터페이스."""
+    def __init__(self, llm, personality=None, llm_reflect=None):
+        self.history: list[dict] = []              # 매일 기록
+        self._reflection: str = ""                 # 최근 자기성찰 결과
+        self.memory = EpisodicMemory(capacity=50)  # 중요 사건 저장소
 
-    base_name: str = "BaseAgent"
+    @abstractmethod
+    def decide(self, state, observation) -> str:
+        """자식 클래스가 반드시 구현해야 하는 행동 결정 함수"""
 
-    def __init__(self, llm: LLMClient, personality: Personality | None = None,
-                 llm_reflect: LLMClient | None = None):
-        self.llm = llm
-        self.llm_reflect = llm_reflect  # Reflection 전용 (고급 모델)
-        self.personality = personality
-        self.name = f"{self.base_name}_{personality.name}" if personality else self.base_name
-        self.history: list[dict] = []   # {"day": int, "action": str, "observation": str}
-        self._reflection: str = ""      # 최근 자기성찰 결과
-        self.memory = EpisodicMemory(capacity=50)  # 중요 사건 기억 저장소
-
-    @abstractmethod # "상속받는 클래스(자식클래스)가 반드시 구현해야 한다"는 강제 규칙
-    def decide(self, state: GameState, observation: str) -> str:    # "나중에 에이전트 타입을 추가할 수 있다"는 확장 가능성을 위한 설계이고, 지금 당장은 없어도 되는 코드
-        """현재 상태를 받아 행동 하나를 반환한다."""
-
-    def decide_batch(self, state: GameState, observation: str, n: int) -> list[str]:
-        """현재 상태를 받아 n일치 행동 계획을 반환한다. 기본은 decide()를 n번 호출."""
+    def decide_batch(self, state, observation, n) -> list[str]:
+        """기본 구현: 같은 행동을 n번 반복 (자식에서 오버라이드)"""
         return [self.decide(state, observation)] * n
-
-    def record(self, day: int, action: str, observation: str):
-        self.history.append({"day": day, "action": action, "observation": observation})
-
-    def reset(self):
-        self.history = []
-        self._reflection = ""
-        self.memory = EpisodicMemory(capacity=50)
-
-    # ------------------------------------------------------------------
-    # 공통 유틸
-    # ------------------------------------------------------------------
-
-    @staticmethod   # self(자기 자신의 데이터에 접근)를 안 쓰는 함수
-    def _parse_action(text: str) -> str:
-        """LLM 응답 텍스트에서 유효한 행동 하나를 추출한다."""
-        for action in ACTIONS:
-            if action in text:
-                return action
-        # 파싱 실패 시 기본 행동
-        return "프로젝트에 집중한다"
-
-    @staticmethod   # 기능적 차이보다는 "이 함수는 객체 상태와 무관하다"는 가독성 표시
-    def _actions_list() -> str:
-        return "\n".join(f"- {a}" for a in ACTIONS)
 ```
 
-react_agent.py
+- `@abstractmethod`: 자식 클래스가 반드시 구현해야 한다는 강제 규칙
+- `decide_batch()`: 기본 구현이 있지만, ReActAgent에서 더 좋은 버전으로 재정의
+
+**ReActAgent (자식)** — 성향을 프롬프트에 주입
 
 ```python
-class ReActAgent(BaseAgent): # 괄호 안이 부모 클래스
-    """ReAct 에이전트: Thought → Action + 에피소드 메모리 & 히스토리 압축 & Reflection."""
-
-    base_name = "ReAct"
-
-    def __init__(self, llm: LLMClient, personality: Personality | None = None,
-                 llm_reflect: LLMClient | None = None):             # 여기서 성향 설명을 프롬프트 템플릿에 미리 주입
+class ReActAgent(BaseAgent):
+    def __init__(self, llm, personality=None, llm_reflect=None):
         super().__init__(llm, personality, llm_reflect=llm_reflect)
-        personality_section = (
-            f"\n당신의 성향: {personality.name}\n{personality.description}"
-            if personality else ""
-        )
-        self._system = SYSTEM_PROMPT.format(
-            actions=self._actions_list(),
-            personality_section=personality_section,
-        )
+        # 성향 설명("당신은 정치형입니다")을 프롬프트 템플릿에 미리 주입
+        personality_section = f"\n당신의 성향: {personality.name}\n{personality.description}"
         self._batch_system_template = BATCH_SYSTEM_PROMPT.replace(
             "{personality_section}", personality_section
         )
 ```
 
-### **run_simulation() → 매일 루프**
+---
+
+### **run_simulation() — 매일 루프**
+
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → 🟢 **`run_simulation()`** → `decide_batch()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+
+7,300번 루프를 도는 시뮬레이션의 심장.
 
 ```python
-def run_simulation(
-    agent: BaseAgent,
-    env: CompanyEnvironment,
-    max_days: int = 1095,
-    log_interval: int = 30,
-    decision_interval: int = 1,
-    reflection_interval: int = 90,
-    log_dir: str = "logs",
-    verbose: bool = True,
-    tqdm_position: int = 0,
-) -> dict:
-    """
-    시뮬레이션을 실행하고 결과를 반환한다.
-    decision_interval > 1이면 배치 모드: N일치 행동을 한 번에 결정한다.
-    상세 로그는 .txt 파일에 기록, 콘솔에는 진행률(%)만 출력한다.
-    반환값: 최종 결과 딕셔너리
-    """
-    state = env.reset()                         # 환경 초기화
-    agent.reset()                               # 에이전트 초기화
-    step_logs = []
-    pending_actions: list[str] = []             # LLM이 짜준 행동 계획 리스트
-    recent_events: list[tuple[int, str]] = []   # (day, 이벤트명) 누적
-    last_reflection_day = 0                     # 마지막 성찰 시점
+state = env.reset()
+agent.reset()
+pending_actions: list[str] = []    # LLM이 짜준 행동 계획 리스트
+last_reflection_day = 0
+
+for day in range(1, max_days + 1):
+    is_weekend = (day - 1) % 7 >= 5
 ```
 
-```python
-for day in range(1, max_days + 1):                        # 핵심
-    is_weekend = (day - 1) % 7 >= 5  # 토(5)/일(6)
+**주말이면:**
 
+```python
     if is_weekend:
-        # 주말: 성향별 가중치로 활동 선택 (LLM 호출X)
         state, full_observation, action = env.step_weekend()
+```
+
+- LLM 호출 없이 성향별 가중치로 활동을 자동 선택
+
+**평일이면:**
+
+```python
     else:
-        # 배치 모드: 30일 계획이 소진되면 새로 요청
-        if not pending_actions:
-            # Reflection: 분기(90일)마다 자기성찰 (llm_reflect가 있을 때만)
-            if (hasattr(agent, 'reflect') and agent.llm_reflect
-                    and day - last_reflection_day >= reflection_interval
-                    and len(agent.history) >= reflection_interval):
-                reflection_text = agent.reflect( # 최근 90일 행동 기록 + 현재 스탯 + 승진 요건을 보내서 전략 조언받기
-                    state, window=reflection_interval, promotion_requirements=env.promotion_requirements,
-                )
-                last_reflection_day = day       # day 값으로 last_reflection_day 갱신
-                if reflection_text:             # 텍스트 로그 파일에 성찰 내용 기록
-                    txt_file.write(f"  [성찰] Day {day}\n")
-                    for line in reflection_text.splitlines():
-                        txt_file.write(f"    {line}\n")
-                    txt_file.flush()
-                    log_file.write(json.dumps({ # JSONL 로그에도 동일하게 기록
-                        "type": "reflection", "day": day,
-                        "text": reflection_text,
-                    }, ensure_ascii=False) + "\n")
-                    log_file.flush()            # flush(): 버퍼에 안 남기고 즉시 파일에 쓰라는 뜻
+        if not pending_actions:              # 30일 계획이 소진됐으면
+            # Reflection 체크 (90일마다)
+            if (agent.llm_reflect
+                    and day - last_reflection_day >= reflection_interval):
+                agent.reflect(state, window=reflection_interval,
+                              promotion_requirements=env.promotion_requirements)
+                last_reflection_day = day
 
-            observation = state.to_observation()    # 현재 스탯 8종을 LLM이 읽을 수 있는 텍스트로 변환
-            remaining = min(decision_interval, max_days - day + 1)  # 배치 주기와 남은 일수 중 작은 값으로 요청
-            if decision_interval > 1:
-                pending_actions = agent.decide_batch(state, observation, remaining) # LLM을 호출해서 30일치 행동 리스트 받아오기
-            else:
-                pending_actions = [agent.decide(state, observation)]
+            # 30일치 행동 계획 생성
+            pending_actions = agent.decide_batch(state, observation, remaining)
+
+        action = pending_actions.pop(0)      # 오늘 행동 하나 꺼내기
+        state, full_observation = env.step(action)
 ```
 
-### **decide_batch() → BaseAgent에서 ReActAgent로**
+- `if not pending_actions` — 30일 계획을 다 썼으면 새로 생성
+- 그 전에 Reflection 조건 확인 → 90일 경과했으면 자기성찰 실행 (코드는 Reflection 심화에서 상세히)
+- `decide_batch()` — LLM 호출해서 30일치 행동 리스트 생성
+- `pop(0)` — 매일 하나씩 꺼내서 실행
+- 매일 LLM을 호출하면 20년에 ~5,200번인데, 30일 배치로 묶으면 ~170번으로 감소
+
+---
+
+### **decide_batch() — 30일 행동 계획 생성**
+
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → `run_simulation()` → 🟢 **`decide_batch()`** → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+
+BaseAgent의 기본 구현(같은 행동 n번 반복)을 ReActAgent가 오버라이드:
 
 ```python
-class BaseAgent(ABC):
-
-    ...(생략)
-
-    def decide_batch(self, state: GameState, observation: str, n: int) -> list[str]:
-        # 기본 구현: 단순히 같은 행동을 n번 반복
-        return [self.decide(state, observation)] * n
+def decide_batch(self, state, observation, n):
+    memory_section = self._build_memory_section()     # ① 메모리 3계층 조합
+    system = self._batch_system_template.format(
+        n=n, actions=self._actions_list(),
+        memory_section=memory_section,                # ② 시스템 프롬프트 조립
+    )
+    messages = [{"role": "user", "content": observation}]
+    response = self.llm.call(system=system,
+                             messages=messages)        # ③ LLM 호출
+    actions = self._parse_batch(response, n)          # ④ 응답 파싱
+    return actions
 ```
 
-```python
-class ReActAgent(BaseAgent):
+| 단계 | 설명 |
+|------|------|
+| ① 메모리 조합 | 에이전트의 기억을 프롬프트용 텍스트로 조합 |
+| ② 프롬프트 조립 | 성향 + 메모리 + 행동 목록을 합쳐서 시스템 프롬프트 생성 |
+| ③ LLM 호출 | "Day 1: ... Day 30: ..." 형식으로 30일치 계획을 요청 |
+| ④ 응답 파싱 | "Day 1: 야근한다" 같은 패턴을 파싱해서 행동 리스트로 변환 |
 
-    ...(생략)
+---
 
-    def decide_batch(self, state: GameState, observation: str, n: int) -> list[str]:
-        memory_section = self._build_memory_section()     # 1. 메모리 3계층 조합
-        system = self._batch_system_template.format(
-            n=n, actions=self._actions_list(),
-            memory_section=memory_section,                # 2. 시스템 프롬프트 조립
-        )
-        messages = [{"role": "user", "content": observation}]
-        response = self.llm.call(system=system, messages=messages, max_tokens=64 * n) # 3. LLM 호출
-        actions = self._parse_batch(response, n)          # 4. "Day 1: 야근한다" 파싱
-        return actions
-```
+### **_build_memory_section() — 3계층 메모리**
 
-1. 에이전트의 기억을 프롬프트용 텍스트로 조합
-2. 성향 + 메모리 + 행동 목록을 합쳐서 시스템 프롬프트 생성
-3. "Day 1: ... Day 30: ..." 형식으로 30일치 계획을 요청
-4. LLM 응답에서 "Day 1: 야근한다" 같은 패턴을 파싱해서 행동 리스트로 생성
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → `run_simulation()` → `decide_batch()` → 🟢 **`_build_memory_section()`** → `env.step()` → `_store_episode_if_important()`
 
-### **_build_memory_section() → 3계층 메모리**
+프롬프트에 들어가는 에이전트의 기억을 3계층으로 조합:
 
 ```python
-def _build_memory_section(self) -> str:
-    """에피소드 메모리 + 히스토리 압축 + Reflection을 프롬프트용 텍스트로 조합한다."""
+def _build_memory_section(self):
     parts = []
 
-    # 1. Reflection 결과 (최우선 전략 지침)
+    # 1층: Reflection 결과 (최우선 전략 지침)
     if self._reflection:
         parts.append(
-            f"[!][!][!] 최우선 전략 지침 (자기성찰 결과) [!][!][!]\n"
-            f"아래 처방된 행동 배분을 반드시 따르세요. 성향과 다르더라도 생존을 위해 필수입니다.\n"
+            "[!][!][!] 최우선 전략 지침 (자기성찰 결과) [!][!][!]\n"
+            "아래 처방된 행동 배분을 반드시 따르세요.\n"
             f"{self._reflection}\n"
-            f"[!] 위 처방을 무시하고 성향대로만 행동하면 해고됩니다."
+            "[!] 위 처방을 무시하고 성향대로만 행동하면 해고됩니다."
         )
 
-    # 2. 에피소딕 메모리 (최근 중요 사건 10개)
+    # 2층: 에피소딕 메모리 (최근 중요 사건 10개)
     memory_text = self.memory.to_text(n=10)
     if memory_text != "기억 없음":
         parts.append(f"[ 과거 주요 경험 ]\n{memory_text}")
 
-    # 3. 히스토리 압축 (최근 30일 행동 패턴 요약)
+    # 3층: 히스토리 압축 (최근 30일 행동 패턴 요약)
     if len(self.history) >= 30:
         summary = compress_history(self.history, self.llm, window=30)
         if summary:
             parts.append(f"[ 최근 행동 패턴 요약 ]\n{summary}")
 
-    if not parts:
-        return ""
     return "\n\n".join(parts)
 ```
 
-1. 자기성찰에서 나온 전략 지침. (이걸 왜 이렇게 강하게 적용했는지는 다음에 설명)
-2. 승진, 해고 위기, 랜덤 이벤트 같은 중요 사건만 기억 (최대 50개 중 최근 10개)
-3. 최근 30일 행동을 LLM이 3문장으로 요약
+| 계층 | 내용 | 역할 |
+|------|------|------|
+| 1층 | Reflection 결과 | `[!][!][!]` 최우선 전략 지침 (이걸 왜 이렇게 강하게 했는지는 Reflection 심화에서 설명) |
+| 2층 | 에피소딕 메모리 | 승진, 해고 위기 등 중요 사건만 기억 (최대 50개 중 최근 10개) |
+| 3층 | 히스토리 압축 | 최근 30일 행동을 LLM이 3문장으로 요약 |
 
 → 이 세 계층이 합쳐져서 배치 결정 프롬프트의 시스템 메시지에 들어감
 
-### run_simulation()으로 복귀
+---
+
+### **env.step() — 환경 처리 (하루)**
+
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → 🟢 **`env.step()`** → `_store_episode_if_important()`
+
+`env.step()`이 하루를 처리:
 
 ```python
-      observation = state.to_observation()    # 현재 스탯 8종을 LLM이 읽을 수 있는 텍스트로 변환
-      remaining = min(decision_interval, max_days - day + 1)  # 배치 주기와 남은 일수 중 작은 값으로 요청
-      if decision_interval > 1:
-          pending_actions = agent.decide_batch(state, observation, remaining) # LLM을 호출해서 30일치 행동 리스트 받아오기
-      else:
-          pending_actions = [agent.decide(state, observation)]
-
-  action = pending_actions.pop(0)         # 리스트 맨 앞에서 행동을 꺼냄 (매일 하나씩 꺼내서 실행)
-
-  # 환경 1일 전진
-  state, full_observation = env.step(action)  # full_observation: 오늘 일어난 일의 텍스트 설명
-```
-
-`decide_batch()`에서 행동 리스트를 받았으면, `pop(0)`으로 오늘 행동을 꺼내서 `env.step(action)`에 넣음
-
-### **env.step()  → 환경 처리**
-
-> env.step()이 하루를 처리함
-
-```python
-def step(self, action: str) -> tuple[GameState, str]:
-
-    ...(생략)
-
+def step(self, action):
     effects = ACTION_EFFECTS[action]
-    self._apply_effects(effects, action)    # ① 행동 효과 적용 (성향 배율 곱셈)
-
-    # 2. 자연 회복 / 자연 저하 (매일 소폭 변화)
-    self._apply_daily_drift()               # ② 자연 회복/저하 (체력+5, 스트레스-2 등)
-
-    # 3. 랜덤 이벤트 발생
-    events = self._filter_events(roll_events(self.rng, self.personality, self.state))     # ③ 랜덤 이벤트 확률 판정
+    self._apply_effects(effects, action)    # ① 행동 효과 적용
+    self._apply_daily_drift()               # ② 자연 회복/저하
+    events = roll_events(self.rng, ...)     # ③ 랜덤 이벤트 판정
     for event in events:
-        self._apply_effects(event.effects)  # 이벤트 효과 적용
-        for key, value in event.resets.items():
-            if hasattr(self.state, key):
-                setattr(self.state, key, float(value))
-        if event.name == "헤드헌터 연락" and self._job_change_cooldown <= 0:
-            self._job_change_counter += 15  # 헤드헌터 연락 시 이직 영향 강화
-        self.state.events_today.append(event.name)
-        log_lines.append(f"이벤트: {event.description}")
-
-    # 4. 수치 범위 클램핑
-    self.state.clamp_all()                  # ④ 모든 스탯 0~100 범위 제한
+        self._apply_effects(event.effects)
+    self.state.clamp_all()                  # ④ 스탯 0~100 범위 제한
+    # ⑤ 번아웃/만성스트레스/해고/승진/이직 판정
 ```
 
-1. 성향별 배율 곱셈 ex. 성과형이 야근하면 성과에 1.5배, 사교형은 0.8배
-2. 매일 자연적으로 변하는 수치. 체력은 조금씩 회복되고, 상사신뢰는 조금씩 깎임
-3. 랜덤이벤트 발생. 회사/팀/개인 단위가 있고 성향별로 가중치 다름
+| 단계 | 설명 |
+|------|------|
+| ① 행동 효과 | 성향별 배율 곱셈. ex) 성과형이 야근하면 성과 1.5배, 사교형은 0.8배 |
+| ② 자연 변화 | 매일 소폭 변동. 체력은 조금씩 회복, 상사신뢰는 조금씩 하락 |
+| ③ 랜덤 이벤트 | 회사(0.2%/일), 팀(1.2%/일), 개인(4%/일) 3티어. 성향별 가중치 다름 |
+| ④ 클램핑 | 모든 스탯 0~100 범위 제한 |
+| ⑤ 생존 판정 | 번아웃, 해고, 승진, 이직 확인 |
 
-마지막에 생존 판정 : 번아웃, 해고, 승진, 이직 확인
+---
 
-### run_simulation()으로 복귀
+### **_store_episode_if_important() — 메모리 저장**
 
-```python
-agent.record(day, action, full_observation)
-_store_episode_if_important(agent, day, action, state, full_observation)
-```
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → `run_simulation()` → `decide_batch()` → `_build_memory_section()` → `env.step()` → 🟢 **`_store_episode_if_important()`**
 
-매일 행동과 결과를 히스토리에 기록하고, 중요한 날만 에피소딕 메모리에 저장
-
-### **_store_episode_if_important() → 메모리 저장**
-
-```python
-def _store_episode_if_important(agent, day: int, action: str, state, observation: str):
-    """중요한 날만 에피소딕 메모리에 저장한다."""
-    outcome = _classify_outcome(state, observation)
-    if outcome is None:
-        return
-    episode = Episode(
-        day=day,
-        action=action,
-        events=list(state.events_today),
-        outcome_summary=outcome,
-        state_snapshot={
-            "position": state.position,
-            "salary": state.salary,
-            "skill": round(state.skill, 1),
-            "performance": round(state.performance, 1),
-            "boss_favor": round(state.boss_favor, 1),
-            "stress": round(state.stress, 1),
-            "energy": round(state.energy, 1),
-        },
-    )
-    agent.memory.add(episode)
-```
-
-### _classify_outcome() **→ 중요도 판별**
+매일 행동과 결과를 히스토리에 기록하고, **중요한 날만** 에피소딕 메모리에 저장:
 
 ```python
-def _classify_outcome(state, observation: str) -> str | None:
-    """오늘 하루의 결과를 분류한다. 중요하지 않으면 None 반환."""
-    obs_lower = observation
-    # 승진
-    if "승진!" in obs_lower:
-        return f"승진: {state.position}"
-    # 이직
-    if "이직!" in obs_lower:
-        return f"이직 (연봉 {state.salary:,}원)"
-    # 해고/퇴사
-    if state.is_fired:
-        return "해고됨"
-    if state.is_resigned:
-        return "자진퇴사"
-    # 랜덤 이벤트 발생
-    if state.events_today:
-        return f"이벤트: {', '.join(state.events_today)}"
-    # 위험 상태 진입 (스트레스 80+ 또는 체력 15 이하)
+def _classify_outcome(state, observation):
+    if "승진!" in observation:  return f"승진: {state.position}"
+    if "이직!" in observation:  return f"이직 (연봉 {state.salary:,}원)"
+    if state.is_fired:          return "해고됨"
+    if state.is_resigned:       return "자진퇴사"
+    if state.events_today:      return f"이벤트: {', '.join(state.events_today)}"
     if state.stress >= 80 and state.energy <= 15:
-        return "번아웃 위기 (스트레스↑ 체력↓)"
+                                return "번아웃 위기"
     if state.performance < 15 and state.boss_favor < 15:
-        return "해고 위기 (성과↓ 상사신뢰↓)"
-    # 평범한 날은 저장하지 않음
-    return None
+                                return "해고 위기"
+    return None                 # 평범한 날 → 저장 안 함
 ```
 
-승진, 이직, 해고, 이벤트, 번아웃 위기, 해고 위기 여기에 해당되면 저장
+- 승진, 이직, 해고, 이벤트, 번아웃 위기, 해고 위기 — 이 6가지에 해당하면 저장
+- 20년치를 다 저장하면 프롬프트가 너무 길어지고 의미도 없음
+- 오래된건 FIFO로 밀려남, 메모리 50개만 유지
 
-20년치를 다 저장하면 프롬프트는 너무 길어지고 의미도 없음
+---
 
-오래된건 FIFO로 밀려남, 메모리 50개만 유지
+### **run_simulation() — 종료 판정**
 
-### run_simulation()으로 복귀
+> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `ReActAgent` → 🟢 **`run_simulation()`** (루프 끝)
 
 ```python
-if not state.is_alive:
-    if state.is_fired:
-        fire_detail = env.analyze_fire().get("detail", "") if env else ""
-        status = "권고사직" if "권고사직" in fire_detail else "해고"
-    else:
-        status = "자진퇴사"
-    analysis_text = _format_exit_analysis(env)
-    txt_file.write(f"[{agent.name}] {day}일차에 {status}됨.\n{analysis_text}\n")
-    txt_file.flush()
-    # JSONL에도 분석 기록
-    exit_analysis = env.analyze_fire() if state.is_fired else env.analyze_resignation()
-    log_file.write(json.dumps({
-        "type": "exit", "day": day, "status": status,
-        "analysis": exit_analysis,
-    }, ensure_ascii=False) + "\n")
-    log_file.flush()
-    pbar.set_postfix_str(f"✗ {status}", refresh=True)
-    break
+    if not state.is_alive:
+        break               # 해고/퇴사 → 루프 종료
 ```
 
-매일 for문 끝에서 state.is_alive 확인 (해고, 퇴사한 경우 루프 빠져나옴)
+매일 for문 끝에서 `state.is_alive` 확인 (해고, 퇴사한 경우 루프 빠져나옴)
 
-20년 버팀을 루프가 자연종료되면 정년퇴직
+20년을 버텨서 루프가 자연종료되면 정년퇴직
 
 ---
 
